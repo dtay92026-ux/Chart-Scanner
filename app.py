@@ -1,30 +1,31 @@
 """
-AI Chart Scanner
-================
-Scores a price chart with 20 widely taught technical-analysis strategies.
+AI Chart Scanner (screenshot edition)
+=====================================
+Upload a screenshot of a chart. The app reads the green and red candles from
+the image, then scores them with 20 widely taught technical-analysis strategies.
 
   * Every strategy casts one vote on the latest candles: BUY, SELL or NEUTRAL.
   * Confidence = share of the 20 strategies that agree on one direction.
   * A BUY or SELL signal is issued only when confidence reaches MIN_CONFIDENCE.
     Strategies that vote the other way still count against the total, so
     conflicting votes lower the confidence and can block the signal.
-  * Each strategy is backtested on the same candles (stop-loss / take-profit
-    simulation), so its historical hit rate is shown next to its vote.
+  * Each strategy is backtested on the candles in the screenshot, so its hit
+    rate and trade count are shown next to its vote.
 
-Data: live OHLC candles from Yahoo Finance (via yfinance) or an uploaded CSV
-(MetaTrader 5 exports work as they are).
+How the screenshot is read: candles are found by colour, not by an AI model.
+Green pixels are bullish and red pixels are bearish. Each candle's body and
+wick are measured in pixel rows. The user enters the prices at the top and
+bottom edges of the cropped image, which turns rows into prices.
 
 Educational use only. This is not financial advice.
 """
 
+import io
+
 import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request
-
-try:
-    import yfinance as yf
-except ImportError:  # CSV uploads still work without yfinance
-    yf = None
+from PIL import Image
 
 
 # ---------------------------------------------------------------------------
@@ -36,13 +37,8 @@ ATR_PERIOD = 14
 STOP_ATR = 1.5           # stop-loss distance, in ATR multiples
 TARGET_ATR = 2.5         # take-profit distance, in ATR multiples
 BACKTEST_HORIZON = 50    # candles a simulated trade may stay open
-
-TIMEFRAMES = {
-    "15m": {"interval": "15m", "period": "60d"},
-    "1h": {"interval": "1h", "period": "730d"},
-    "1d": {"interval": "1d", "period": "5y"},
-}
-SYMBOL_ALIASES = {"XAUUSD": "GC=F", "XAGUSD": "SI=F"}  # Yahoo Finance tickers for metals
+MIN_CANDLES = 60         # strategies need this many candles to warm up
+MAX_UPLOAD_MB = 10
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +356,68 @@ STRATEGIES = [
 
 
 # ---------------------------------------------------------------------------
+# Reading candles from a screenshot
+# ---------------------------------------------------------------------------
+def read_candles(image_bytes, top_price, bottom_price):
+    """
+    Turn a cropped chart screenshot into OHLC candles, left to right.
+
+    The image's top edge is top_price and its bottom edge is bottom_price.
+    Pixel rows are converted to prices with that linear scale.
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise ValueError("That file is not an image the scanner can read. Use PNG, JPG or WEBP.")
+
+    hsv = np.asarray(img.convert("HSV")).astype(int)
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]   # Pillow HSV: each channel 0-255
+    vivid = (sat >= 90) & (val >= 60)                       # ignores grey, white and dark backgrounds
+    green = vivid & (hue >= 60) & (hue <= 140)
+    red = vivid & ((hue <= 15) | (hue >= 235))
+    colored = green | red
+
+    height = colored.shape[0]
+    has_candle = colored.sum(axis=0) >= 3   # ignores 1-2 px lines such as dotted price markers
+    edges = np.diff(np.r_[0, has_candle.astype(int), 0])
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1) - 1
+
+    def to_price(y):
+        return top_price - (y / (height - 1)) * (top_price - bottom_price)
+
+    candles = []
+    for x0, x1 in zip(starts, ends):
+        g = green[:, x0:x1 + 1]
+        r = red[:, x0:x1 + 1]
+        row_counts = (g | r).sum(axis=1)
+        rows = np.flatnonzero(row_counts)
+        if rows.size == 0:
+            continue
+
+        # Body rows are the wide rows; the wick is a thin line through the middle.
+        peak = row_counts.max()
+        body = np.flatnonzero(row_counts >= max(min(2, peak), 0.5 * peak))
+        high_y, low_y = rows[0], rows[-1]
+        body_top, body_bottom = body[0], body[-1]
+
+        bullish = g.sum() >= r.sum()
+        if bullish:
+            open_y, close_y = body_bottom, body_top
+        else:
+            open_y, close_y = body_top, body_bottom
+
+        candles.append({
+            "open": to_price(open_y),
+            "high": to_price(high_y),
+            "low": to_price(low_y),
+            "close": to_price(close_y),
+        })
+
+    return pd.DataFrame(candles, columns=["open", "high", "low", "close"])
+
+
+# ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
 def latest_vote(signals):
@@ -411,8 +469,11 @@ def price_decimals(price):
 
 
 def analyze(df):
-    if len(df) < 60:
-        raise ValueError(f"Need at least 60 candles, got {len(df)}.")
+    if len(df) < MIN_CANDLES:
+        raise ValueError(
+            f"Found {len(df)} candles. The scanner needs at least {MIN_CANDLES}. "
+            "Use a screenshot that shows more bars."
+        )
 
     atr_series = atr(df)
     rows = []
@@ -472,60 +533,17 @@ def analyze(df):
 
 
 # ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-def normalise_symbol(raw):
-    s = raw.strip().upper()
-    if s in SYMBOL_ALIASES:
-        return SYMBOL_ALIASES[s]
-    if len(s) == 6 and s.isalpha():
-        return f"{s}=X"  # EURUSD -> EURUSD=X on Yahoo Finance
-    return s
-
-
-def fetch_market_data(raw_symbol, timeframe):
-    if yf is None:
-        raise RuntimeError("yfinance is not installed. Run: pip install -r requirements.txt")
-    symbol = normalise_symbol(raw_symbol)
-    spec = TIMEFRAMES[timeframe]
-    raw = yf.download(symbol, interval=spec["interval"], period=spec["period"],
-                      progress=False, auto_adjust=False)
-    if raw.empty:
-        raise ValueError(f"No market data returned for {symbol}. Check the symbol.")
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    df = raw.rename(columns=str.lower)[["open", "high", "low", "close"]].dropna()
-    return df, symbol
-
-
-def load_csv(file):
-    raw = pd.read_csv(file)
-    raw.columns = [str(c).strip().strip("<>").strip().lower() for c in raw.columns]
-    missing = [c for c in ("open", "high", "low", "close") if c not in raw.columns]
-    if missing:
-        raise ValueError(f"CSV is missing column(s): {', '.join(missing)}")
-
-    index = None
-    if {"date", "time"} <= set(raw.columns):  # MetaTrader export: <DATE>, <TIME>
-        stamps = raw["date"].astype(str).str.replace(".", "-", regex=False) + " " + raw["time"].astype(str)
-        index = pd.to_datetime(stamps, errors="coerce")
-    else:
-        for col in ("datetime", "timestamp", "time", "date"):
-            if col in raw.columns:
-                index = pd.to_datetime(raw[col], errors="coerce")
-                break
-
-    prices = raw[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
-    if index is not None:
-        prices.index = index
-        prices = prices[prices.index.notna()].sort_index()
-    return prices.dropna()
-
-
-# ---------------------------------------------------------------------------
 # Web app
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+def parse_price(text, name):
+    try:
+        return float((text or "").strip())
+    except ValueError:
+        raise ValueError(f"Enter the {name} shown on the price scale.")
 
 
 @app.get("/")
@@ -536,32 +554,34 @@ def home():
 @app.post("/api/scan")
 def scan():
     try:
-        upload = request.files.get("csv")
-        if upload and upload.filename:
-            df = load_csv(upload)
-            label, timeframe = upload.filename, "custom"
-        else:
-            symbol = request.form.get("symbol", "").strip()
-            timeframe = request.form.get("timeframe", "1h")
-            if not symbol:
-                raise ValueError("Enter a symbol such as EURUSD or XAUUSD, or upload a CSV.")
-            if timeframe not in TIMEFRAMES:
-                raise ValueError("Unsupported timeframe.")
-            df, label = fetch_market_data(symbol, timeframe)
+        upload = request.files.get("image")
+        if not upload or not upload.filename:
+            raise ValueError("Upload a chart screenshot.")
+
+        top = parse_price(request.form.get("top_price"), "top price")
+        bottom = parse_price(request.form.get("bottom_price"), "bottom price")
+        if top <= bottom:
+            raise ValueError("The top price must be higher than the bottom price.")
+
+        df = read_candles(upload.read(), top, bottom)
+        if df.empty:
+            raise ValueError(
+                "No green or red candles found. Crop to the candles and use a chart with coloured candles."
+            )
 
         result = analyze(df)
         result.update(
-            symbol=label,
-            timeframe=timeframe,
+            symbol=request.form.get("symbol", "").strip() or upload.filename,
             candles=len(df),
-            last_time=str(df.index[-1]),
+            top_price=top,
+            bottom_price=bottom,
         )
         return jsonify(result)
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except Exception:
         app.logger.exception("Scan failed")
-        return jsonify(error="Scan failed. Check the symbol, timeframe or CSV format."), 500
+        return jsonify(error="Scan failed. Try a clearer, uncompressed screenshot."), 500
 
 
 PAGE = """<!doctype html>
@@ -583,11 +603,13 @@ main{max-width:980px;margin:0 auto;padding:28px 20px 56px}
 .muted{color:var(--muted)}
 .small{font-size:13px}
 .error{color:var(--sell)}
-form{display:grid;grid-template-columns:1.1fr 1fr 1.2fr auto;gap:12px;align-items:end}
+form{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;align-items:end}
+.span-2{grid-column:span 2}
 label{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px}
-input,select{width:100%;padding:11px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:9px;color:var(--text);font:inherit}
-input:focus,select:focus{outline:none;border-color:var(--accent)}
-button{padding:12px 22px;border:0;border-radius:9px;background:var(--accent);color:#fff;font-family:inherit;font-size:15px;font-weight:600;cursor:pointer}
+input{width:100%;padding:11px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:9px;color:var(--text);font:inherit}
+input[type=file]{padding:9px 10px}
+input:focus{outline:none;border-color:var(--accent)}
+button{width:100%;padding:12px 22px;border:0;border-radius:9px;background:var(--accent);color:#fff;font-family:inherit;font-size:15px;font-weight:600;cursor:pointer}
 button:disabled{opacity:.6;cursor:wait}
 #status{min-height:20px;margin:14px 0 4px}
 .signal-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}
@@ -618,6 +640,7 @@ th{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;le
 .disclaimer{font-size:12px;color:var(--muted);text-align:center;margin-top:24px}
 @media(max-width:720px){
   form{grid-template-columns:1fr}
+  .span-2{grid-column:auto}
   .levels{grid-template-columns:1fr 1fr}
   .signal-head{flex-direction:column}
   .conf{text-align:left}
@@ -628,31 +651,31 @@ th{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;le
 <body>
 <header>
   <div class="brand">AI <span>Chart Scanner</span></div>
-  <div class="muted small">20 strategies &middot; consensus signal</div>
+  <div class="muted small">Screenshot in &middot; consensus signal out</div>
 </header>
 <main>
   <section class="card">
     <form id="scan-form">
       <div>
-        <label for="symbol">Symbol</label>
-        <input id="symbol" name="symbol" value="EURUSD" placeholder="EURUSD, GBPJPY, XAUUSD" autocomplete="off">
+        <label for="symbol">Label (optional)</label>
+        <input id="symbol" name="symbol" placeholder="EURUSD 1H" autocomplete="off">
       </div>
       <div>
-        <label for="timeframe">Timeframe</label>
-        <select id="timeframe" name="timeframe">
-          <option value="15m">15 minutes</option>
-          <option value="1h" selected>1 hour</option>
-          <option value="1d">Daily</option>
-        </select>
+        <label for="top_price">Price at top edge</label>
+        <input id="top_price" name="top_price" inputmode="decimal" placeholder="1.0850" required>
       </div>
       <div>
-        <label for="csv">Or upload CSV</label>
-        <input id="csv" name="csv" type="file" accept=".csv">
+        <label for="bottom_price">Price at bottom edge</label>
+        <input id="bottom_price" name="bottom_price" inputmode="decimal" placeholder="1.0780" required>
+      </div>
+      <div class="span-2">
+        <label for="image">Chart screenshot</label>
+        <input id="image" name="image" type="file" accept="image/png,image/jpeg,image/webp" required>
       </div>
       <button id="scan-btn" type="submit">Scan chart</button>
     </form>
     <p id="status" class="muted small"></p>
-    <p class="muted small">A CSV needs open, high, low and close columns. A time column is optional. MetaTrader exports work as they are.</p>
+    <p class="muted small">Crop the screenshot to the candles only, leaving out the price scale, volume and indicator panes. Enter the prices shown at the top and bottom edges of the cropped image. Works with green and red candles.</p>
   </section>
 
   <div id="results"></div>
@@ -675,7 +698,7 @@ form.addEventListener("submit", async (event) => {
   button.disabled = true;
   results.innerHTML = "";
   statusLine.className = "muted small";
-  statusLine.textContent = "Fetching candles and running 20 strategies\u2026";
+  statusLine.textContent = "Reading candles and running 20 strategies\u2026";
   try {
     const response = await fetch("/api/scan", {method: "POST", body: new FormData(form)});
     const data = await response.json();
@@ -711,7 +734,7 @@ function render(d) {
     <section class="card signal ${cls}">
       <div class="signal-head">
         <div>
-          <div class="muted small">${esc(d.symbol)} &middot; ${esc(d.timeframe)} &middot; ${d.candles} candles &middot; last ${esc(d.last_time)}</div>
+          <div class="muted small">${esc(d.symbol)} &middot; ${d.candles} candles read from screenshot</div>
           <div class="sig-label">${esc(d.signal)}</div>
           <div class="muted">${esc(d.reason)}</div>
         </div>
