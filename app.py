@@ -1,21 +1,19 @@
 """
-AI Chart Scanner (screenshot edition)
-=====================================
-Upload a screenshot of a chart. The app reads the green and red candles from
-the image, then scores them with 20 widely taught technical-analysis strategies.
+Chart Scanner
+=============
+Upload a chart screenshot. The app reads the green and red candles from the
+image, runs 20 widely taught technical-analysis strategies on them, and issues
+a BUY, SELL or HOLD signal with a confidence score.
 
-  * Every strategy casts one vote on the latest candles: BUY, SELL or NEUTRAL.
-  * Confidence = share of the 20 strategies that agree on one direction.
-  * A BUY or SELL signal is issued only when confidence reaches MIN_CONFIDENCE.
-    Strategies that vote the other way still count against the total, so
-    conflicting votes lower the confidence and can block the signal.
-  * Each strategy is backtested on the candles in the screenshot, so its hit
-    rate and trade count are shown next to its vote.
+  * Each strategy votes BUY, SELL or NEUTRAL on the latest candles.
+  * Confidence = share of the 20 strategies that agree.
+  * A BUY or SELL is issued only when confidence reaches MIN_CONFIDENCE.
+    Opposing votes count against the total, so conflicts lower confidence.
+  * Each strategy is backtested on the candles in the screenshot.
 
-How the screenshot is read: candles are found by colour, not by an AI model.
-Green pixels are bullish and red pixels are bearish. Each candle's body and
-wick are measured in pixel rows. The user enters the prices at the top and
-bottom edges of the cropped image, which turns rows into prices.
+No price scale is needed. The strategies only use candle shape (crossovers,
+ratios and ranges), so the signal is the same at any price level. Stop and
+target are expressed in ATR units, the average candle range.
 
 Educational use only. This is not financial advice.
 """
@@ -34,8 +32,8 @@ from PIL import Image
 MIN_CONFIDENCE = 70      # % of strategies that must agree before a signal is issued
 VOTE_LOOKBACK = 5        # a strategy's latest trigger within this many candles still counts as its vote
 ATR_PERIOD = 14
-STOP_ATR = 1.5           # stop-loss distance, in ATR multiples
-TARGET_ATR = 2.5         # take-profit distance, in ATR multiples
+STOP_ATR = 1.5           # stop distance, in ATR units
+TARGET_ATR = 2.5         # target distance, in ATR units
 BACKTEST_HORIZON = 50    # candles a simulated trade may stay open
 MIN_CANDLES = 60         # strategies need this many candles to warm up
 MAX_UPLOAD_MB = 10
@@ -265,9 +263,10 @@ def s_cci(df):
     return _signal(df.index, crossed_above(value, -100), crossed_below(value, 100))
 
 
-def s_roc(df):
-    roc = 100 * df["close"].pct_change(12)
-    return _signal(df.index, crossed_above(roc, 0), crossed_below(roc, 0))
+def s_momentum(df, n=12):
+    """Close minus the close n bars ago, in ATR units. Crossing zero means direction changed."""
+    change = (df["close"] - df["close"].shift(n)) / atr(df)
+    return _signal(df.index, crossed_above(change, 0), crossed_below(change, 0))
 
 
 # Volatility
@@ -287,8 +286,8 @@ def s_keltner_breakout(df):
 
 def s_bb_squeeze(df):
     close = df["close"]
-    mid, upper, lower = bollinger(close)
-    width = (upper - lower) / mid
+    _, upper, lower = bollinger(close)
+    width = upper - lower  # absolute width, so the result does not depend on the price level
     squeezed = (width <= width.rolling(120).quantile(0.2)).shift().fillna(False).astype(bool)
     return _signal(df.index, squeezed & (close > upper), squeezed & (close < lower))
 
@@ -345,7 +344,7 @@ STRATEGIES = [
     ("Stochastic cross in extremes", "Momentum", s_stochastic),
     ("Williams %R cross", "Momentum", s_williams_r),
     ("CCI +/-100 cross", "Momentum", s_cci),
-    ("ROC zero-line cross", "Momentum", s_roc),
+    ("12-bar momentum zero cross", "Momentum", s_momentum),
     ("Bollinger band bounce", "Volatility", s_bollinger_bounce),
     ("Keltner channel breakout", "Volatility", s_keltner_breakout),
     ("Bollinger squeeze breakout", "Volatility", s_bb_squeeze),
@@ -358,12 +357,70 @@ STRATEGIES = [
 # ---------------------------------------------------------------------------
 # Reading candles from a screenshot
 # ---------------------------------------------------------------------------
-def read_candles(image_bytes, top_price, bottom_price):
-    """
-    Turn a cropped chart screenshot into OHLC candles, left to right.
+def _grow(mask, seed):
+    """Return the (top, bottom) rows of the contiguous True block that contains seed."""
+    top = bottom = seed
+    while top > 0 and mask[top - 1]:
+        top -= 1
+    while bottom < len(mask) - 1 and mask[bottom + 1]:
+        bottom += 1
+    return top, bottom
 
-    The image's top edge is top_price and its bottom edge is bottom_price.
-    Pixel rows are converted to prices with that linear scale.
+
+def _candle_grid(strong_counts):
+    """
+    Find the spacing between candles and the x position of the first candle centre.
+
+    Each run of coloured columns is one candle, so its middle is that candle's centre.
+    The centres sit on a regular grid. A rough spacing comes from the typical gap
+    between neighbouring centres, then a straight line is fitted through each centre
+    against its candle index. Runs that merge two candles are outliers and are dropped.
+    """
+    mask = strong_counts > 0
+    edges = np.diff(np.r_[0, mask.astype(int), 0])
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1) - 1
+    centres = (starts + ends) / 2.0
+    if len(centres) < 3:
+        raise ValueError("Could not find enough candles in this image.")
+
+    diffs = np.diff(centres)
+    typical = np.median(diffs)
+    single = diffs[(diffs > 0.75 * typical) & (diffs < 1.25 * typical)]  # gaps of exactly one candle
+    if single.size < 3:
+        raise ValueError("Candles touch each other in this screenshot. Use fewer bars or a wider chart.")
+    rough = single.mean()  # sub-pixel: whole-pixel gaps average out to the true spacing
+    index = np.round((centres - centres[0]) / rough)
+    keep = np.ones(len(centres), dtype=bool)
+    for _ in range(4):
+        design = np.c_[np.ones(keep.sum()), index[keep]]
+        (offset, period), *_ = np.linalg.lstsq(design, centres[keep], rcond=None)
+        keep = np.abs(centres - (offset + period * index)) < 0.25 * period
+
+    widths = ends - starts + 1
+    if np.median(widths) >= 0.95 * period:
+        raise ValueError("Candles touch each other in this screenshot. Use fewer bars or a wider chart.")
+    return float(period), float(offset % period)
+
+
+def _longest_run(mask):
+    """Longest horizontal run of True pixels in each row of a small mask."""
+    run = np.zeros(mask.shape[0], dtype=int)
+    best = np.zeros(mask.shape[0], dtype=int)
+    for x in range(mask.shape[1]):
+        run = (run + 1) * mask[:, x]
+        best = np.maximum(best, run)
+    return best
+
+
+def read_candles(image_bytes):
+    """
+    Turn a chart screenshot into OHLC candles, left to right.
+
+    Candles are assumed to sit at a regular spacing, as on standard price charts.
+    Each candle is read from its own slot, so touching candles are kept apart.
+    Prices are relative: 1.0 at the top edge of the image and 0.0 at the bottom.
+    Strategies only use candle shape, so the absolute price level is not needed.
     """
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -377,32 +434,45 @@ def read_candles(image_bytes, top_price, bottom_price):
     red = vivid & ((hue <= 15) | (hue >= 235))
     colored = green | red
 
-    height = colored.shape[0]
-    has_candle = colored.sum(axis=0) >= 3   # ignores 1-2 px lines such as dotted price markers
-    edges = np.diff(np.r_[0, has_candle.astype(int), 0])
-    starts = np.flatnonzero(edges == 1)
-    ends = np.flatnonzero(edges == -1) - 1
+    height, width = colored.shape
+    col_counts = colored.sum(axis=0)
+    strong_counts = np.where(col_counts >= 3, col_counts, 0)  # wicks and bodies; ignores 1-2 px dotted lines
+    if strong_counts.max() == 0:
+        return pd.DataFrame(columns=["open", "high", "low", "close"])
+
+    period, phase = _candle_grid(strong_counts)
 
     def to_price(y):
-        return top_price - (y / (height - 1)) * (top_price - bottom_price)
+        return 1.0 - y / (height - 1)
 
     candles = []
-    for x0, x1 in zip(starts, ends):
-        g = green[:, x0:x1 + 1]
-        r = red[:, x0:x1 + 1]
-        row_counts = (g | r).sum(axis=1)
-        rows = np.flatnonzero(row_counts)
-        if rows.size == 0:
+    for centre in np.arange(phase, width, period):
+        # Only columns whose centre lies inside this candle's slot. Rounding outwards
+        # would pick up the edge of a neighbouring candle.
+        x0 = max(0, int(np.ceil(centre - period / 2 + 1e-9)))
+        x1 = min(width, int(np.floor(centre + period / 2 - 1e-9)) + 1)
+        if x1 <= x0:
+            continue
+        g = green[:, x0:x1]
+        r = red[:, x0:x1]
+        both = g | r
+        if both.sum(axis=0).max() < 3:  # no wick or body in this slot
             continue
 
-        # Body rows are the wide rows; the wick is a thin line through the middle.
-        peak = row_counts.max()
-        body = np.flatnonzero(row_counts >= max(min(2, peak), 0.5 * peak))
-        high_y, low_y = rows[0], rows[-1]
-        body_top, body_bottom = body[0], body[-1]
+        # The body is the block of wide rows around the widest row. The wick is the
+        # contiguous run of coloured rows above and below it, so stray pixels elsewhere
+        # in the slot (such as a dotted price line) do not stretch the candle.
+        runs = _longest_run(both)
+        peak_row = int(np.argmax(runs))
+        peak = runs[peak_row]
+        body_top, body_bottom = _grow(runs >= max(min(2, peak), 0.75 * peak), peak_row)
+        present = both.any(axis=1)
+        high_y = _grow(present, body_top)[0]
+        low_y = _grow(present, body_bottom)[1]
 
-        bullish = g.sum() >= r.sum()
-        if bullish:
+        body_green = g[body_top:body_bottom + 1].sum()
+        body_red = r[body_top:body_bottom + 1].sum()
+        if body_green >= body_red:
             open_y, close_y = body_bottom, body_top
         else:
             open_y, close_y = body_top, body_bottom
@@ -428,7 +498,7 @@ def latest_vote(signals):
 
 
 def backtest(df, signals, atr_series):
-    """Enter at each signal's close; exit at stop-loss or take-profit (stop wins ties)."""
+    """Enter at each signal's close; exit at stop or target in ATR units (stop wins ties)."""
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
     closes = df["close"].to_numpy()
@@ -460,19 +530,11 @@ def backtest(df, signals, atr_series):
     }
 
 
-def price_decimals(price):
-    if price >= 1000:
-        return 2  # gold, indices
-    if price >= 20:
-        return 3  # JPY pairs
-    return 5      # most FX pairs
-
-
 def analyze(df):
     if len(df) < MIN_CANDLES:
         raise ValueError(
             f"Found {len(df)} candles. The scanner needs at least {MIN_CANDLES}. "
-            "Use a screenshot that shows more bars."
+            "Use a screenshot with more bars."
         )
 
     atr_series = atr(df)
@@ -490,9 +552,6 @@ def analyze(df):
     buy_votes = sum(r["vote"] == 1 for r in rows)
     sell_votes = sum(r["vote"] == -1 for r in rows)
     neutral = total - buy_votes - sell_votes
-    last_price = float(df["close"].iloc[-1])
-    last_atr = float(atr_series.iloc[-1])
-    decimals = price_decimals(last_price)
 
     direction = 0 if buy_votes == sell_votes else (1 if buy_votes > sell_votes else -1)
     agreeing = max(buy_votes, sell_votes)
@@ -503,19 +562,14 @@ def analyze(df):
         signal, reason = "HOLD", "Buy and sell votes are tied."
     elif confidence < MIN_CONFIDENCE:
         signal = "HOLD"
-        reason = f"Only {agreeing} of {total} strategies agree; {MIN_CONFIDENCE}% is required."
+        reason = f"Only {agreeing} of {total} strategies agree. {MIN_CONFIDENCE}% is required."
     else:
         signal = "BUY" if direction == 1 else "SELL"
         reason = f"{agreeing} of {total} strategies agree on {signal}."
         if dissenting:
             reason += f" {dissenting} voted the other way."
 
-    entry = stop_loss = take_profit = None
-    if signal != "HOLD":
-        entry = round(last_price, decimals)
-        stop_loss = round(last_price - direction * STOP_ATR * last_atr, decimals)
-        take_profit = round(last_price + direction * TARGET_ATR * last_atr, decimals)
-
+    last = df.iloc[-1]
     return {
         "signal": signal,
         "reason": reason,
@@ -523,11 +577,11 @@ def analyze(df):
         "buy_votes": buy_votes,
         "sell_votes": sell_votes,
         "neutral": neutral,
-        "last_price": round(last_price, decimals),
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "decimals": decimals,
+        "candles": len(df),
+        "last_candle": "Bullish" if last["close"] >= last["open"] else "Bearish",
+        "stop_atr": STOP_ATR,
+        "target_atr": TARGET_ATR,
+        "reward_risk": round(TARGET_ATR / STOP_ATR, 2),
         "strategies": rows,
     }
 
@@ -537,13 +591,6 @@ def analyze(df):
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
-
-
-def parse_price(text, name):
-    try:
-        return float((text or "").strip())
-    except ValueError:
-        raise ValueError(f"Enter the {name} shown on the price scale.")
 
 
 @app.get("/")
@@ -558,30 +605,16 @@ def scan():
         if not upload or not upload.filename:
             raise ValueError("Upload a chart screenshot.")
 
-        top = parse_price(request.form.get("top_price"), "top price")
-        bottom = parse_price(request.form.get("bottom_price"), "bottom price")
-        if top <= bottom:
-            raise ValueError("The top price must be higher than the bottom price.")
-
-        df = read_candles(upload.read(), top, bottom)
+        df = read_candles(upload.read())
         if df.empty:
-            raise ValueError(
-                "No green or red candles found. Crop to the candles and use a chart with coloured candles."
-            )
+            raise ValueError("No green or red candles found. Try a screenshot of the candles only.")
 
-        result = analyze(df)
-        result.update(
-            symbol=request.form.get("symbol", "").strip() or upload.filename,
-            candles=len(df),
-            top_price=top,
-            bottom_price=bottom,
-        )
-        return jsonify(result)
+        return jsonify(analyze(df))
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except Exception:
         app.logger.exception("Scan failed")
-        return jsonify(error="Scan failed. Try a clearer, uncompressed screenshot."), 500
+        return jsonify(error="Scan failed. Try a clearer screenshot."), 500
 
 
 PAGE = """<!doctype html>
@@ -590,178 +623,336 @@ PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>AI Chart Scanner</title>
+<title>Chart Scanner</title>
 <style>
-:root{--bg:#0a0f1c;--panel:#111a2e;--panel-2:#0c1426;--line:#1d2943;--text:#e7edf7;--muted:#8793ab;--accent:#4c8dff;--buy:#14c784;--sell:#f0434c;--hold:#f5b93a}
+:root{
+  --bg:#070b14;--panel:#0d1424;--panel-2:#09101e;--line:#1a2539;--track:#17223a;
+  --text:#e4ebf7;--muted:#7b889f;--accent:#58c4ff;--buy:#2bd98b;--sell:#ff4d6d;--hold:#ffc857;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-header{display:flex;justify-content:space-between;align-items:center;padding:18px 28px;border-bottom:1px solid var(--line)}
-.brand{font-weight:700;font-size:17px;letter-spacing:.2px}
-.brand span{color:var(--accent)}
-main{max-width:980px;margin:0 auto;padding:28px 20px 56px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:18px}
-.muted{color:var(--muted)}
-.small{font-size:13px}
-.error{color:var(--sell)}
-form{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;align-items:end}
-.span-2{grid-column:span 2}
-label{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px}
-input{width:100%;padding:11px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:9px;color:var(--text);font:inherit}
-input[type=file]{padding:9px 10px}
-input:focus{outline:none;border-color:var(--accent)}
-button{width:100%;padding:12px 22px;border:0;border-radius:9px;background:var(--accent);color:#fff;font-family:inherit;font-size:15px;font-weight:600;cursor:pointer}
-button:disabled{opacity:.6;cursor:wait}
-#status{min-height:20px;margin:14px 0 4px}
-.signal-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}
-.sig-label{font-size:40px;font-weight:800;letter-spacing:1px;margin:4px 0}
-.signal.buy .sig-label{color:var(--buy)}
-.signal.sell .sig-label{color:var(--sell)}
-.signal.hold .sig-label{color:var(--hold)}
-.conf{text-align:right}
-.conf-value{font-size:34px;font-weight:700}
-.bar{height:8px;background:var(--panel-2);border-radius:99px;overflow:hidden;margin:18px 0}
-.bar span{display:block;height:100%;background:var(--accent);transition:width .6s}
-.signal.buy .bar span{background:var(--buy)}
-.signal.sell .bar span{background:var(--sell)}
-.signal.hold .bar span{background:var(--hold)}
-.levels{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.levels div{background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
-.levels span{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
-.levels b{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:16px;font-weight:600}
-h3{margin:0 0 12px;font-size:16px}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{padding:10px 8px;border-bottom:1px solid var(--line);text-align:left}
-th{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
-.num{text-align:right;font-family:ui-monospace,Menlo,Consolas,monospace}
-.pill{display:inline-block;min-width:76px;text-align:center;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:700}
-.pill.buy{background:rgba(20,199,132,.14);color:var(--buy)}
-.pill.sell{background:rgba(240,67,76,.14);color:var(--sell)}
-.pill.flat{background:#18223a;color:var(--muted)}
-.disclaimer{font-size:12px;color:var(--muted);text-align:center;margin-top:24px}
-@media(max-width:720px){
-  form{grid-template-columns:1fr}
-  .span-2{grid-column:auto}
-  .levels{grid-template-columns:1fr 1fr}
-  .signal-head{flex-direction:column}
-  .conf{text-align:left}
-  .sig-label{font-size:30px}
+[hidden]{display:none!important}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);
+  font:13px/1.5 Inter,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(700px 380px at 50% -8%,rgba(88,196,255,.13),transparent 62%),
+             radial-gradient(560px 340px at 100% 100%,rgba(155,140,255,.10),transparent 62%)}
+#bg{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
+.mono{font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+.top{position:relative;z-index:1;display:flex;justify-content:space-between;align-items:center;
+  padding:12px 18px;border-bottom:1px solid var(--line);background:rgba(7,11,20,.72);backdrop-filter:blur(6px)}
+.brand{display:flex;align-items:center;gap:10px;font-size:11px;font-weight:600;letter-spacing:2px;text-transform:uppercase}
+.logo{width:20px;height:20px}
+.meta{font-size:11px;color:var(--muted);letter-spacing:.5px}
+
+main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:22px 16px 36px}
+
+.drop{position:relative;display:block;height:300px;cursor:pointer;outline:none;overflow:hidden;
+  border:1.5px dashed rgba(88,196,255,.42);border-radius:18px;
+  background:linear-gradient(180deg,rgba(13,20,36,.92),rgba(9,16,30,.92));
+  transition:border-color .2s,box-shadow .2s,transform .2s}
+.drop:hover,.drop:focus-visible,.drop.over{border-color:var(--accent);
+  box-shadow:0 0 0 1px rgba(88,196,255,.22),0 0 30px rgba(88,196,255,.16)}
+.drop.over{transform:scale(1.01)}
+.drop input{display:none}
+.drop-empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
+.plus{width:54px;height:54px;fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round;
+  transition:transform .3s ease}
+.drop:hover .plus{transform:rotate(90deg)}
+.drop-empty span{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#a9c9e6}
+
+.drop-preview{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#05080f}
+.drop-preview img{max-width:calc(100% - 24px);max-height:calc(100% - 24px);object-fit:contain;border-radius:10px}
+.beam{position:absolute;left:0;right:0;top:0;height:2px;opacity:0;pointer-events:none;
+  background:linear-gradient(90deg,transparent,var(--accent),transparent);box-shadow:0 0 14px var(--accent)}
+.drop.scanning .beam{opacity:1;animation:sweep 1.5s ease-in-out infinite}
+@keyframes sweep{0%{top:0}50%{top:calc(100% - 2px)}100%{top:0}}
+
+.hint{margin:10px 2px 0;font-size:11px;color:var(--muted)}
+.status{min-height:18px;margin:8px 2px 0;font-size:12px;color:var(--muted)}
+.status.error{color:var(--sell)}
+
+.results{margin-top:18px;display:grid;gap:12px;animation:rise .35s ease-out}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px}
+.hero{display:flex;justify-content:space-between;align-items:center;gap:16px}
+.sig{font-size:18px;font-weight:700;letter-spacing:1.5px}
+.sub{margin-top:4px;font-size:12px;color:var(--muted)}
+.results.buy{--tone:var(--buy)}
+.results.sell{--tone:var(--sell)}
+.results.hold{--tone:var(--hold)}
+.results .sig{color:var(--tone)}
+
+.ring{position:relative;width:76px;height:76px;flex:none}
+.ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+.ring circle{fill:none;stroke-width:6}
+.ring .track{stroke:var(--track)}
+.ring .arc{stroke:var(--tone);stroke-linecap:round;transition:stroke-dashoffset .9s ease}
+.ring .val{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600}
+
+.facts{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.fact{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+.fact span{display:block;font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)}
+.fact b{display:block;margin-top:2px;font-family:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;font-size:13px;font-weight:600}
+
+.section{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px}
+.section h3{margin:0;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:600}
+.section small{font-size:10px;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.tile{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:11px 12px;animation:rise .4s both}
+.tile-top{display:flex;justify-content:space-between;align-items:center}
+.fam{font-size:10px;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted)}
+.chip{font-size:10px;font-weight:700;letter-spacing:1px;padding:2px 8px;border-radius:6px;border:1px solid}
+.chip.buy{color:var(--buy);border-color:rgba(43,217,139,.4);background:rgba(43,217,139,.08)}
+.chip.sell{color:var(--sell);border-color:rgba(255,77,109,.4);background:rgba(255,77,109,.08)}
+.chip.flat{color:var(--muted);border-color:var(--line)}
+.tile-name{margin:7px 0 9px;font-size:13px;font-weight:500}
+.bt{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)}
+.bt-bar{flex:1;height:4px;border-radius:4px;background:var(--track);overflow:hidden}
+.bt-bar span{display:block;height:100%;background:var(--accent)}
+.bt .mono{color:var(--text)}
+
+.foot{margin:22px 0 0;text-align:center;font-size:11px;color:var(--muted)}
+
+@media(max-width:600px){
+  .facts{grid-template-columns:repeat(2,1fr)}
+  .grid{grid-template-columns:1fr}
+  .drop{height:260px}
 }
 </style>
 </head>
 <body>
-<header>
-  <div class="brand">AI <span>Chart Scanner</span></div>
-  <div class="muted small">Screenshot in &middot; consensus signal out</div>
+<canvas id="bg" aria-hidden="true"></canvas>
+
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 20 20" aria-hidden="true">
+      <line x1="4" y1="1" x2="4" y2="19" stroke="#2bd98b" stroke-width="1.4"/>
+      <rect x="2.5" y="5" width="3" height="8" fill="#2bd98b"/>
+      <line x1="10" y1="0" x2="10" y2="18" stroke="#ff4d6d" stroke-width="1.4"/>
+      <rect x="8.5" y="4" width="3" height="9" fill="#ff4d6d"/>
+      <line x1="16" y1="2" x2="16" y2="20" stroke="#58c4ff" stroke-width="1.4"/>
+      <rect x="14.5" y="7" width="3" height="7" fill="#58c4ff"/>
+    </svg>
+    <span>Chart Scanner</span>
+  </div>
+  <div class="meta">20 strategies</div>
 </header>
+
 <main>
-  <section class="card">
-    <form id="scan-form">
-      <div>
-        <label for="symbol">Label (optional)</label>
-        <input id="symbol" name="symbol" placeholder="EURUSD 1H" autocomplete="off">
-      </div>
-      <div>
-        <label for="top_price">Price at top edge</label>
-        <input id="top_price" name="top_price" inputmode="decimal" placeholder="1.0850" required>
-      </div>
-      <div>
-        <label for="bottom_price">Price at bottom edge</label>
-        <input id="bottom_price" name="bottom_price" inputmode="decimal" placeholder="1.0780" required>
-      </div>
-      <div class="span-2">
-        <label for="image">Chart screenshot</label>
-        <input id="image" name="image" type="file" accept="image/png,image/jpeg,image/webp" required>
-      </div>
-      <button id="scan-btn" type="submit">Scan chart</button>
-    </form>
-    <p id="status" class="muted small"></p>
-    <p class="muted small">Crop the screenshot to the candles only, leaving out the price scale, volume and indicator panes. Enter the prices shown at the top and bottom edges of the cropped image. Works with green and red candles.</p>
-  </section>
+  <label id="drop" class="drop" tabindex="0" role="button" aria-label="Upload chart">
+    <input id="file" type="file" accept="image/png,image/jpeg,image/webp">
+    <div id="drop-empty" class="drop-empty">
+      <svg class="plus" viewBox="0 0 54 54" aria-hidden="true">
+        <path d="M27 8v38M8 27h38"/>
+      </svg>
+      <span>Upload chart</span>
+    </div>
+    <div id="drop-preview" class="drop-preview" hidden>
+      <img id="preview" alt="Uploaded chart">
+      <div class="beam"></div>
+    </div>
+  </label>
+  <p class="hint">Candles only. Leave out the price scale and volume panes.</p>
+  <p id="status" class="status"></p>
 
-  <div id="results"></div>
+  <section id="results" class="results" hidden></section>
 
-  <p class="disclaimer">Educational tool, not financial advice. Backtests use simplified fills and past results do not guarantee future performance. Trading carries a high risk of loss.</p>
+  <p class="foot">Educational tool, not financial advice. Backtests are simplified and past results do not guarantee future ones.</p>
 </main>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const form = $("scan-form");
-const button = $("scan-btn");
+const drop = $("drop");
+const fileInput = $("file");
+const emptyBox = $("drop-empty");
+const previewBox = $("drop-preview");
+const preview = $("preview");
 const statusLine = $("status");
 const results = $("results");
 
 const VOTE = {"1": ["BUY", "buy"], "-1": ["SELL", "sell"], "0": ["NEUTRAL", "flat"]};
+const RING = 2 * Math.PI * 34;
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  button.disabled = true;
-  results.innerHTML = "";
-  statusLine.className = "muted small";
-  statusLine.textContent = "Reading candles and running 20 strategies\u2026";
-  try {
-    const response = await fetch("/api/scan", {method: "POST", body: new FormData(form)});
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "Scan failed.");
-    statusLine.textContent = "";
-    render(data);
-  } catch (err) {
-    statusLine.className = "error small";
-    statusLine.textContent = err.message;
-  } finally {
-    button.disabled = false;
-  }
+function setStatus(msg, kind) {
+  statusLine.textContent = msg;
+  statusLine.className = "status" + (kind ? " " + kind : "");
+}
+
+fileInput.addEventListener("change", () => {
+  const picked = fileInput.files[0];
+  fileInput.value = "";
+  if (picked) scan(picked);
 });
 
-function render(d) {
-  const cls = d.signal.toLowerCase();
-  const fmt = (v) => (v === null ? "\u2014" : Number(v).toFixed(d.decimals));
+drop.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    fileInput.click();
+  }
+});
+["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => {
+  e.preventDefault();
+  drop.classList.add("over");
+}));
+["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => {
+  e.preventDefault();
+  drop.classList.remove("over");
+}));
+drop.addEventListener("drop", (e) => {
+  const dropped = e.dataTransfer.files[0];
+  if (dropped) scan(dropped);
+});
 
-  const rows = d.strategies.map((s) => {
+async function scan(file) {
+  if (!file.type.startsWith("image/")) {
+    setStatus("Use a PNG, JPG or WEBP screenshot.", "error");
+    return;
+  }
+  preview.src = URL.createObjectURL(file);
+  emptyBox.hidden = true;
+  previewBox.hidden = false;
+  drop.classList.add("scanning");
+  results.hidden = true;
+  results.innerHTML = "";
+  setStatus("Reading candles and running 20 strategies", "");
+
+  const body = new FormData();
+  body.append("image", file);
+  try {
+    const response = await fetch("/api/scan", {method: "POST", body});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Scan failed.");
+    setStatus("", "");
+    render(data);
+  } catch (err) {
+    setStatus(err.message, "error");
+  } finally {
+    drop.classList.remove("scanning");
+  }
+}
+
+function render(d) {
+  const sig = d.signal.toLowerCase();
+  const pct = d.confidence;
+
+  const tiles = d.strategies.map((s, i) => {
     const [label, tone] = VOTE[String(s.vote)];
-    const win = s.backtest.win_rate === null
-      ? '<span class="muted">n/a</span>'
-      : `${s.backtest.win_rate}% <span class="muted">(${s.backtest.trades})</span>`;
-    return `<tr>
-      <td>${esc(s.name)}</td>
-      <td class="muted">${esc(s.category)}</td>
-      <td><span class="pill ${tone}">${label}</span></td>
-      <td class="num">${win}</td>
-    </tr>`;
+    const wr = s.backtest.win_rate;
+    return `<div class="tile" style="animation-delay:${i * 35}ms">
+      <div class="tile-top"><span class="fam">${esc(s.category)}</span><span class="chip ${tone}">${label}</span></div>
+      <div class="tile-name">${esc(s.name)}</div>
+      <div class="bt">
+        <div class="bt-bar"><span style="width:${wr ?? 0}%"></span></div>
+        <span class="mono">${wr === null ? "n/a" : wr.toFixed(1) + "%"}</span>
+        <span class="mono">${s.backtest.trades} trades</span>
+      </div>
+    </div>`;
   }).join("");
 
+  results.className = `results ${sig}`;
   results.innerHTML = `
-    <section class="card signal ${cls}">
-      <div class="signal-head">
+    <div class="card">
+      <div class="hero">
         <div>
-          <div class="muted small">${esc(d.symbol)} &middot; ${d.candles} candles read from screenshot</div>
-          <div class="sig-label">${esc(d.signal)}</div>
-          <div class="muted">${esc(d.reason)}</div>
+          <div class="sig">${esc(d.signal)}</div>
+          <div class="sub">${esc(d.reason)}</div>
         </div>
-        <div class="conf">
-          <div class="conf-value">${d.confidence.toFixed(0)}%</div>
-          <div class="muted small">confidence</div>
+        <div class="ring">
+          <svg viewBox="0 0 76 76">
+            <circle class="track" cx="38" cy="38" r="34"></circle>
+            <circle class="arc" cx="38" cy="38" r="34" stroke-dasharray="${RING}"
+              stroke-dashoffset="${RING}" data-target="${RING * (1 - pct / 100)}"></circle>
+          </svg>
+          <div class="val mono">${pct.toFixed(0)}%</div>
         </div>
       </div>
-      <div class="bar"><span style="width:${d.confidence}%"></span></div>
-      <div class="levels">
-        <div><span>Last close</span><b>${fmt(d.last_price)}</b></div>
-        <div><span>Stop loss</span><b>${fmt(d.stop_loss)}</b></div>
-        <div><span>Take profit</span><b>${fmt(d.take_profit)}</b></div>
-        <div><span>Buy / sell / neutral</span><b>${d.buy_votes} / ${d.sell_votes} / ${d.neutral}</b></div>
-      </div>
-    </section>
+    </div>
 
-    <section class="card">
-      <h3>Strategy breakdown</h3>
-      <table>
-        <thead>
-          <tr><th>Strategy</th><th>Family</th><th>Vote now</th><th class="num">Backtest win rate (trades)</th></tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </section>`;
+    <div class="facts">
+      <div class="fact"><span>Buy votes</span><b>${d.buy_votes}</b></div>
+      <div class="fact"><span>Sell votes</span><b>${d.sell_votes}</b></div>
+      <div class="fact"><span>Neutral</span><b>${d.neutral}</b></div>
+      <div class="fact"><span>Last candle</span><b>${esc(d.last_candle)}</b></div>
+    </div>
+
+    <div class="facts">
+      <div class="fact"><span>Candles read</span><b>${d.candles}</b></div>
+      <div class="fact"><span>Stop</span><b>${d.stop_atr} ATR</b></div>
+      <div class="fact"><span>Target</span><b>${d.target_atr} ATR</b></div>
+      <div class="fact"><span>Reward : risk</span><b>1 : ${d.reward_risk}</b></div>
+    </div>
+
+    <div class="card">
+      <div class="section">
+        <h3>Strategies</h3>
+        <small>backtest win rate and trades</small>
+      </div>
+      <div class="grid">${tiles}</div>
+    </div>`;
+  results.hidden = false;
+
+  requestAnimationFrame(() => {
+    const arc = results.querySelector(".arc");
+    if (arc) arc.style.strokeDashoffset = arc.dataset.target;
+  });
 }
+
+// Faint candlesticks drifting behind the page
+const bg = $("bg");
+const bctx = bg.getContext("2d");
+const STEP = 18;
+let series = [];
+let shift = 0;
+const yAt = (v, h) => h * 0.5 - (v - 60) * 5;
+
+function nextCandle(prev) {
+  const o = prev;
+  const c = o + (60 - o) * 0.04 + (Math.random() - 0.5) * 4;
+  return {o, c, h: Math.max(o, c) + Math.random() * 2, l: Math.min(o, c) - Math.random() * 2};
+}
+
+function resizeBg() {
+  bg.width = innerWidth;
+  bg.height = innerHeight;
+  series = [];
+  let p = 60;
+  for (let i = 0; i < Math.ceil(innerWidth / STEP) + 2; i++) {
+    const k = nextCandle(p);
+    series.push(k);
+    p = k.c;
+  }
+}
+
+function paintBg() {
+  const h = bg.height;
+  bctx.clearRect(0, 0, bg.width, h);
+  shift += 0.3;
+  if (shift >= STEP) {
+    shift -= STEP;
+    series.shift();
+    series.push(nextCandle(series[series.length - 1].c));
+  }
+  series.forEach((k, i) => {
+    const x = i * STEP - shift;
+    const rgb = k.c >= k.o ? "43,217,139" : "255,77,109";
+    bctx.strokeStyle = `rgba(${rgb},0.16)`;
+    bctx.fillStyle = `rgba(${rgb},0.12)`;
+    bctx.beginPath();
+    bctx.moveTo(x, yAt(k.h, h));
+    bctx.lineTo(x, yAt(k.l, h));
+    bctx.stroke();
+    const top = yAt(Math.max(k.o, k.c), h);
+    const bottom = yAt(Math.min(k.o, k.c), h);
+    bctx.fillRect(x - 3.5, top, 7, Math.max(2, bottom - top));
+  });
+  requestAnimationFrame(paintBg);
+}
+
+addEventListener("resize", resizeBg);
+resizeBg();
+if (!matchMedia("(prefers-reduced-motion: reduce)").matches) requestAnimationFrame(paintBg);
 </script>
 </body>
 </html>
@@ -769,5 +960,5 @@ function render(d) {
 
 
 if __name__ == "__main__":
-    # Development server. In production run: gunicorn app:app
+    # Development server. In production run: gunicorn app:app --bind 0.0.0.0:$PORT
     app.run(host="127.0.0.1", port=5000, debug=True)
