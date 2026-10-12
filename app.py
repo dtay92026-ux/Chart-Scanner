@@ -2,41 +2,43 @@
 Chart Scanner
 =============
 Upload a chart screenshot. The app reads the green and red candles from the
-image, runs 20 widely taught technical-analysis strategies on them, and issues
-a BUY, SELL or HOLD signal with a confidence score.
+image and checks five widely used strategies on the chart as it is now.
 
-  * Each strategy votes BUY, SELL or NEUTRAL on the latest candles.
-  * Confidence = share of the 20 strategies that agree.
-  * A BUY or SELL is issued only when confidence reaches MIN_CONFIDENCE.
-    Opposing votes count against the total, so conflicts lower confidence.
-  * Each strategy is backtested on the candles in the screenshot.
+  * Each strategy reads the current state of the chart and votes BUY, SELL or
+    NEUTRAL. Votes do not depend on crossovers from earlier in the chart.
+  * Neutral bands mean a small move cannot flip a vote.
+  * Confidence = share of the five strategies that agree.
+  * A BUY or SELL needs at least MIN_AGREE agreeing and at most MAX_DISSENT
+    dissenting. Otherwise the signal is HOLD.
 
-No price scale is needed. The strategies only use candle shape (crossovers,
-ratios and ranges), so the signal is the same at any price level. Stop and
-target are expressed in ATR units, the average candle range.
-
+Only the uploaded screenshot is used. No prices or data are fetched.
 Educational use only. This is not financial advice.
 """
 
 import io
+import mimetypes
 
 import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request
 from PIL import Image
 
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+
 
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
-MIN_CONFIDENCE = 70      # % of strategies that must agree before a signal is issued
-VOTE_LOOKBACK = 5        # a strategy's latest trigger within this many candles still counts as its vote
+MIN_CANDLES = 60       # indicators need this many candles to settle
+MIN_AGREE = 3          # strategies that must point the same way for a signal
+MAX_DISSENT = 1        # strategies allowed to point the other way
 ATR_PERIOD = 14
-STOP_ATR = 1.5           # stop distance, in ATR units
-TARGET_ATR = 2.5         # target distance, in ATR units
-BACKTEST_HORIZON = 50    # candles a simulated trade may stay open
-MIN_CANDLES = 60         # strategies need this many candles to warm up
+STOP_ATR = 1.5         # stop distance, in ATR units (the average candle range)
+TARGET_ATR = 2.5       # target distance, in ATR units
 MAX_UPLOAD_MB = 10
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +46,6 @@ MAX_UPLOAD_MB = 10
 # ---------------------------------------------------------------------------
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
-
-
-def sma(s, n):
-    return s.rolling(n).mean()
 
 
 def atr(df, n=ATR_PERIOD):
@@ -63,43 +61,12 @@ def rsi(close, n=14):
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    return 100 - 100 / (1 + gain / loss)
+    return (100 - 100 / (1 + gain / loss)).fillna(50.0)
 
 
 def macd(close, fast=12, slow=26, signal=9):
     line = ema(close, fast) - ema(close, slow)
     return line, ema(line, signal)
-
-
-def stochastic(df, k=14, d=3):
-    lo = df["low"].rolling(k).min()
-    hi = df["high"].rolling(k).max()
-    pct_k = 100 * (df["close"] - lo) / (hi - lo)
-    return pct_k, pct_k.rolling(d).mean()
-
-
-def williams_r(df, n=14):
-    hi = df["high"].rolling(n).max()
-    lo = df["low"].rolling(n).min()
-    return -100 * (hi - df["close"]) / (hi - lo)
-
-
-def cci(df, n=20):
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    mean_dev = typical.rolling(n).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-    return (typical - typical.rolling(n).mean()) / (0.015 * mean_dev)
-
-
-def bollinger(close, n=20, k=2):
-    mid = sma(close, n)
-    sd = close.rolling(n).std()
-    return mid, mid + k * sd, mid - k * sd
-
-
-def keltner(df, n=20, mult=2.0):
-    mid = ema(df["close"], n)
-    band = mult * atr(df, 10)
-    return mid, mid + band, mid - band
 
 
 def adx(df, n=14):
@@ -108,22 +75,14 @@ def adx(df, n=14):
     plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
     minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
     smoothed_atr = atr(df, n)
-    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / smoothed_atr
-    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / smoothed_atr
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    plus_di = (100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / smoothed_atr).fillna(0.0)
+    minus_di = (100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / smoothed_atr).fillna(0.0)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0.0)
     return dx.ewm(alpha=1 / n, adjust=False).mean(), plus_di, minus_di
 
 
-def ichimoku(df):
-    hi, lo = df["high"], df["low"]
-    tenkan = (hi.rolling(9).max() + lo.rolling(9).min()) / 2
-    kijun = (hi.rolling(26).max() + lo.rolling(26).min()) / 2
-    span_a = ((tenkan + kijun) / 2).shift(26)
-    span_b = ((hi.rolling(52).max() + lo.rolling(52).min()) / 2).shift(26)
-    return tenkan, kijun, span_a, span_b
-
-
 def supertrend(df, n=10, mult=3.0):
+    """Returns (trend, line): trend is +1 above the Supertrend line and -1 below it."""
     band = mult * atr(df, n).to_numpy()
     hl2 = ((df["high"] + df["low"]) / 2).to_numpy()
     basic_up, basic_dn = hl2 + band, hl2 - band
@@ -139,268 +98,114 @@ def supertrend(df, n=10, mult=3.0):
             trend[i] = 1
         else:
             trend[i] = trend[i - 1]
-    return pd.Series(trend, index=df.index)
-
-
-def heikin_ashi(df):
-    ha_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
-    ha_open = np.empty(len(df))
-    ha_open[0] = (df["open"].iloc[0] + df["close"].iloc[0]) / 2
-    hc = ha_close.to_numpy()
-    for i in range(1, len(df)):
-        ha_open[i] = (ha_open[i - 1] + hc[i - 1]) / 2
-    return pd.Series(ha_open, index=df.index), ha_close
+    line = np.where(trend == 1, dn, up)
+    return pd.Series(trend, index=df.index), pd.Series(line, index=df.index)
 
 
 # ---------------------------------------------------------------------------
-# Signal helpers
+# The five strategies. Each reads the chart as it is now, including the newest
+# candle, and returns BUY (1), SELL (-1) or NEUTRAL (0) with a short reading.
+# Thresholds are in ATR units or fixed levels, so they do not depend on price.
 # ---------------------------------------------------------------------------
-def crossed_above(a, b):
-    b = pd.Series(b, index=a.index) if np.isscalar(b) else b
-    return (a > b) & (a.shift() <= b.shift())
+def read_strategies(df):
+    close = df["close"]
+    unit = float(atr(df).iloc[-1])
+    readings = []
 
+    # 1. Moving average trend: price and the 20 and 50 averages stacked in order.
+    e20, e50 = ema(close, 20), ema(close, 50)
+    c, a20, a50 = float(close.iloc[-1]), float(e20.iloc[-1]), float(e50.iloc[-1])
+    if c > a20 > a50 and a20 - a50 >= 0.2 * unit:
+        vote, text = 1, "Price is above the 20 and 50 averages, and the 20 is above the 50"
+    elif c < a20 < a50 and a50 - a20 >= 0.2 * unit:
+        vote, text = -1, "Price is below the 20 and 50 averages, and the 20 is below the 50"
+    else:
+        vote, text = 0, "The averages are mixed or too close to call"
+    readings.append(("Moving average trend", "Trend", vote, text))
 
-def crossed_below(a, b):
-    b = pd.Series(b, index=a.index) if np.isscalar(b) else b
-    return (a < b) & (a.shift() >= b.shift())
+    # 2. Supertrend: which side of the trailing ATR line price is on.
+    trend, line_st = supertrend(df)
+    st, st_line = int(trend.iloc[-1]), float(line_st.iloc[-1])
+    if abs(c - st_line) < 0.1 * unit:
+        vote, text = 0, "Price is too close to the Supertrend line to call"
+    elif st == 1:
+        vote, text = 1, "Price is above the Supertrend line"
+    else:
+        vote, text = -1, "Price is below the Supertrend line"
+    readings.append(("Supertrend", "Trend", vote, text))
 
+    # 3. MACD: the line must sit on one side of zero and clearly on one side of its signal.
+    line, signal_line = macd(close)
+    m_now, s_now = float(line.iloc[-1]), float(signal_line.iloc[-1])
+    if m_now > 0 and m_now - s_now >= 0.05 * unit:
+        vote, text = 1, "MACD is above zero and above its signal line"
+    elif m_now < 0 and s_now - m_now >= 0.05 * unit:
+        vote, text = -1, "MACD is below zero and below its signal line"
+    else:
+        vote, text = 0, "MACD is mixed or flat"
+    readings.append(("MACD", "Momentum", vote, text))
 
-def _signal(index, buy, sell):
-    """Turn two boolean masks into +1 (buy), -1 (sell) or 0 for every candle."""
-    b = buy.fillna(False).astype(bool).to_numpy()
-    s = sell.fillna(False).astype(bool).to_numpy()
-    return pd.Series(np.select([b, s], [1, -1], default=0), index=index)
+    # 4. RSI zones: a neutral band between 45 and 55 keeps small moves from flipping it.
+    r = float(rsi(close).iloc[-1])
+    if r >= 55:
+        vote, text = 1, f"RSI {r:.0f}, bullish zone"
+    elif r <= 45:
+        vote, text = -1, f"RSI {r:.0f}, bearish zone"
+    else:
+        vote, text = 0, f"RSI {r:.0f}, neutral zone"
+    readings.append(("RSI zone", "Momentum", vote, text))
 
-
-# ---------------------------------------------------------------------------
-# The 20 strategies. Each returns +1 (buy), -1 (sell) or 0 for every candle.
-# ---------------------------------------------------------------------------
-
-# Trend following
-def s_ema_cross(df):
-    fast, slow = ema(df["close"], 20), ema(df["close"], 50)
-    return _signal(df.index, crossed_above(fast, slow), crossed_below(fast, slow))
-
-
-def s_golden_cross(df):
-    fast, slow = sma(df["close"], 50), sma(df["close"], 200)
-    return _signal(df.index, crossed_above(fast, slow), crossed_below(fast, slow))
-
-
-def s_macd(df):
-    line, signal_line = macd(df["close"])
-    return _signal(df.index, crossed_above(line, signal_line), crossed_below(line, signal_line))
-
-
-def s_adx_di(df):
+    # 5. ADX direction: a trend must be strong enough, and one side must lead clearly.
     adx_v, plus_di, minus_di = adx(df)
-    trending = adx_v > 25
-    return _signal(
-        df.index,
-        crossed_above(plus_di, minus_di) & trending,
-        crossed_below(plus_di, minus_di) & trending,
-    )
+    v, p_di, m_di = float(adx_v.iloc[-1]), float(plus_di.iloc[-1]), float(minus_di.iloc[-1])
+    if v >= 25 and p_di - m_di >= 5:
+        vote, text = 1, f"ADX {v:.0f}, strong upward trend"
+    elif v >= 25 and m_di - p_di >= 5:
+        vote, text = -1, f"ADX {v:.0f}, strong downward trend"
+    elif v >= 20:
+        vote, text = 0, f"ADX {v:.0f}, trend forming"
+    else:
+        vote, text = 0, f"ADX {v:.0f}, no clear trend"
+    readings.append(("ADX direction", "Trend strength", vote, text))
 
-
-def s_ichimoku(df):
-    tenkan, kijun, span_a, span_b = ichimoku(df)
-    cloud_top = np.maximum(span_a, span_b)
-    cloud_bottom = np.minimum(span_a, span_b)
-    close = df["close"]
-    return _signal(
-        df.index,
-        crossed_above(tenkan, kijun) & (close > cloud_top),
-        crossed_below(tenkan, kijun) & (close < cloud_bottom),
-    )
-
-
-def s_supertrend(df):
-    trend = supertrend(df)
-    return _signal(df.index, crossed_above(trend, 0), crossed_below(trend, 0))
-
-
-def s_donchian(df, n=20):
-    high_n = df["high"].rolling(n).max().shift()
-    low_n = df["low"].rolling(n).min().shift()
-    return _signal(df.index, df["close"] > high_n, df["close"] < low_n)
-
-
-def s_heikin_ashi(df):
-    ha_open, ha_close = heikin_ashi(df)
-    bull = (ha_close > ha_open).astype(float)
-    bear = 1 - bull
-    bull_run, bear_run = bull.rolling(3).sum(), bear.rolling(3).sum()
-    return _signal(
-        df.index,
-        (bull_run == 3) & (bull_run.shift() < 3),
-        (bear_run == 3) & (bear_run.shift() < 3),
-    )
-
-
-# Momentum
-def s_rsi_reversal(df):
-    r = rsi(df["close"])
-    return _signal(df.index, crossed_above(r, 30), crossed_below(r, 70))
-
-
-def s_rsi_centerline(df):
-    r = rsi(df["close"])
-    return _signal(df.index, crossed_above(r, 50), crossed_below(r, 50))
-
-
-def s_stochastic(df):
-    k, d = stochastic(df)
-    return _signal(df.index, crossed_above(k, d) & (k < 20), crossed_below(k, d) & (k > 80))
-
-
-def s_williams_r(df):
-    wr = williams_r(df)
-    return _signal(df.index, crossed_above(wr, -80), crossed_below(wr, -20))
-
-
-def s_cci(df):
-    value = cci(df)
-    return _signal(df.index, crossed_above(value, -100), crossed_below(value, 100))
-
-
-def s_momentum(df, n=12):
-    """Close minus the close n bars ago, in ATR units. Crossing zero means direction changed."""
-    change = (df["close"] - df["close"].shift(n)) / atr(df)
-    return _signal(df.index, crossed_above(change, 0), crossed_below(change, 0))
-
-
-# Volatility
-def s_bollinger_bounce(df):
-    close = df["close"]
-    _, upper, lower = bollinger(close)
-    buy = (close.shift() < lower.shift()) & (close > lower)   # closed back above the lower band
-    sell = (close.shift() > upper.shift()) & (close < upper)  # closed back below the upper band
-    return _signal(df.index, buy, sell)
-
-
-def s_keltner_breakout(df):
-    _, upper, lower = keltner(df)
-    close = df["close"]
-    return _signal(df.index, crossed_above(close, upper), crossed_below(close, lower))
-
-
-def s_bb_squeeze(df):
-    close = df["close"]
-    _, upper, lower = bollinger(close)
-    width = upper - lower  # absolute width, so the result does not depend on the price level
-    squeezed = (width <= width.rolling(120).quantile(0.2)).shift().fillna(False).astype(bool)
-    return _signal(df.index, squeezed & (close > upper), squeezed & (close < lower))
-
-
-# Market structure
-def s_fibonacci(df, swing=30):
-    close = df["close"]
-    hi = df["high"].rolling(swing).max()
-    lo = df["low"].rolling(swing).min()
-    rng = hi - lo
-    band = 0.25 * atr(df)
-    ema50, ema200 = ema(close, 50), ema(close, 200)
-    fib_up = hi - 0.618 * rng  # 61.8% retracement of the swing, in an uptrend
-    fib_dn = lo + 0.618 * rng  # 61.8% retracement of the swing, in a downtrend
-    buy = (ema50 > ema200) & (df["low"] <= fib_up + band) & (close > fib_up) & (close > df["open"])
-    sell = (ema50 < ema200) & (df["high"] >= fib_dn - band) & (close < fib_dn) & (close < df["open"])
-    return _signal(df.index, buy, sell)
-
-
-# Candlestick price action
-def s_engulfing(df):
-    o, c = df["open"], df["close"]
-    po, pc = o.shift(), c.shift()
-    trend = ema(c, 50)
-    bullish = (pc < po) & (c > o) & (o <= pc) & (c >= po) & (pc < trend.shift())
-    bearish = (pc > po) & (c < o) & (o >= pc) & (c <= po) & (pc > trend.shift())
-    return _signal(df.index, bullish, bearish)
-
-
-def s_pin_bar(df):
-    o, h, lo, c = df["open"], df["high"], df["low"], df["close"]
-    top, bottom = np.maximum(o, c), np.minimum(o, c)
-    body = top - bottom
-    rng = (h - lo).replace(0, np.nan)
-    upper_wick, lower_wick = h - top, bottom - lo
-    small_body = body <= 0.3 * rng
-    trend = ema(c, 20)
-    bullish = small_body & (lower_wick >= 2 * body) & (lower_wick >= 0.6 * rng) & (c < trend)
-    bearish = small_body & (upper_wick >= 2 * body) & (upper_wick >= 0.6 * rng) & (c > trend)
-    return _signal(df.index, bullish, bearish)
-
-
-STRATEGIES = [
-    ("EMA 20/50 crossover", "Trend", s_ema_cross),
-    ("SMA 50/200 golden cross", "Trend", s_golden_cross),
-    ("MACD signal-line cross", "Trend", s_macd),
-    ("ADX + DI cross", "Trend", s_adx_di),
-    ("Ichimoku TK cross", "Trend", s_ichimoku),
-    ("Supertrend flip", "Trend", s_supertrend),
-    ("Donchian 20 breakout", "Trend", s_donchian),
-    ("Heikin-Ashi 3-candle flip", "Trend", s_heikin_ashi),
-    ("RSI 30/70 reversal", "Momentum", s_rsi_reversal),
-    ("RSI 50 centerline cross", "Momentum", s_rsi_centerline),
-    ("Stochastic cross in extremes", "Momentum", s_stochastic),
-    ("Williams %R cross", "Momentum", s_williams_r),
-    ("CCI +/-100 cross", "Momentum", s_cci),
-    ("12-bar momentum zero cross", "Momentum", s_momentum),
-    ("Bollinger band bounce", "Volatility", s_bollinger_bounce),
-    ("Keltner channel breakout", "Volatility", s_keltner_breakout),
-    ("Bollinger squeeze breakout", "Volatility", s_bb_squeeze),
-    ("Fibonacci 61.8% pullback", "Structure", s_fibonacci),
-    ("Engulfing candle", "Price action", s_engulfing),
-    ("Pin bar rejection", "Price action", s_pin_bar),
-]
+    return [
+        {"name": name, "family": family, "vote": int(vote), "reading": text}
+        for name, family, vote, text in readings
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Reading candles from a screenshot
 # ---------------------------------------------------------------------------
-def _grow(mask, seed):
-    """Return the (top, bottom) rows of the contiguous True block that contains seed."""
-    top = bottom = seed
-    while top > 0 and mask[top - 1]:
-        top -= 1
-    while bottom < len(mask) - 1 and mask[bottom + 1]:
-        bottom += 1
-    return top, bottom
-
-
-def _candle_grid(strong_counts):
+def _colour_masks(img):
     """
-    Find the spacing between candles and the x position of the first candle centre.
-
-    Each run of coloured columns is one candle, so its middle is that candle's centre.
-    The centres sit on a regular grid. A rough spacing comes from the typical gap
-    between neighbouring centres, then a straight line is fitted through each centre
-    against its candle index. Runs that merge two candles are outliers and are dropped.
+    Find green and red pixels. The chart background is the most common colour, and a
+    pixel counts as coloured when it is far enough from that background. Testing the
+    distance from the background, rather than a brightness threshold, keeps thin wicks
+    and blurred edges (JPEG) readable. Channel ratios keep out cyan, blue and orange lines.
     """
-    mask = strong_counts > 0
-    edges = np.diff(np.r_[0, mask.astype(int), 0])
-    starts = np.flatnonzero(edges == 1)
-    ends = np.flatnonzero(edges == -1) - 1
-    centres = (starts + ends) / 2.0
-    if len(centres) < 3:
-        raise ValueError("Could not find enough candles in this image.")
+    rgb = np.asarray(img).astype(np.int16)
+    coarse = (rgb // 16).reshape(-1, 3)
+    codes = coarse[:, 0] * 256 + coarse[:, 1] * 16 + coarse[:, 2]
+    values, counts = np.unique(codes, return_counts=True)
+    most_common = int(values[np.argmax(counts)])
+    background = np.array([most_common // 256, (most_common // 16) % 16, most_common % 16]) * 16 + 8
 
-    diffs = np.diff(centres)
-    typical = np.median(diffs)
-    single = diffs[(diffs > 0.75 * typical) & (diffs < 1.25 * typical)]  # gaps of exactly one candle
-    if single.size < 3:
-        raise ValueError("Candles touch each other in this screenshot. Use fewer bars or a wider chart.")
-    rough = single.mean()  # sub-pixel: whole-pixel gaps average out to the true spacing
-    index = np.round((centres - centres[0]) / rough)
-    keep = np.ones(len(centres), dtype=bool)
-    for _ in range(4):
-        design = np.c_[np.ones(keep.sum()), index[keep]]
-        (offset, period), *_ = np.linalg.lstsq(design, centres[keep], rcond=None)
-        keep = np.abs(centres - (offset + period * index)) < 0.25 * period
-
-    widths = ends - starts + 1
-    if np.median(widths) >= 0.95 * period:
-        raise ValueError("Candles touch each other in this screenshot. Use fewer bars or a wider chart.")
-    return float(period), float(offset % period)
+    distance = np.sqrt(((rgb - background) ** 2).sum(axis=2).astype(float))
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    is_green = (g >= 1.2 * r) & (g >= b - 10) & (g - r >= 25)
+    is_red = (r >= 1.6 * g) & (r - b >= 25) & (r - g >= 40)
+    green = (distance >= 50) & is_green
+    red = (distance >= 50) & is_red
+    solid = ((distance >= 110) & is_green) | ((distance >= 110) & is_red)   # bright cores only
+    # Drop pixels with no coloured neighbour above or below. Candle bodies and wicks are
+    # vertical, so they keep their pixels, but dotted or dashed price lines do not.
+    above = np.zeros_like(solid)
+    above[1:] = solid[:-1]
+    below = np.zeros_like(solid)
+    below[:-1] = solid[1:]
+    solid = solid & (above | below)
+    return green, red, solid
 
 
 def _longest_run(mask):
@@ -413,42 +218,140 @@ def _longest_run(mask):
     return best
 
 
+def _row_groups(present, max_gap=2):
+    """
+    Groups of coloured rows, as (top, bottom). Gaps of up to max_gap rows stay inside one
+    group, because compression can break a wick into pieces. One-pixel-tall groups (dotted
+    price lines) are dropped.
+    """
+    edges = np.diff(np.r_[0, present.astype(int), 0])
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1) - 1
+    groups = []
+    for s, e in zip(starts, ends):
+        if groups and s - groups[-1][1] - 1 <= max_gap:
+            groups[-1] = (groups[-1][0], int(e))
+        else:
+            groups.append((int(s), int(e)))
+    return [(s, e) for s, e in groups if e - s + 1 >= 2]
+
+
+def _grow(mask, seed, max_gap=0):
+    """
+    Return the (top, bottom) rows of the block of True rows that contains seed.
+    Gaps of up to max_gap rows do not end the block, because compression can
+    break a thin wick into pieces.
+    """
+    def walk(step):
+        position = last_true = seed
+        while True:
+            nxt = position + step
+            if nxt < 0 or nxt >= len(mask):
+                break
+            if mask[nxt]:
+                position = last_true = nxt
+            elif abs(nxt - last_true) <= max_gap:
+                position = nxt
+            else:
+                break
+        return last_true
+
+    return walk(-1), walk(1)
+
+
+def _fit_grid(strong_counts):
+    """
+    Find the candle grid. Each run of coloured columns is one candle, so its middle
+    is that candle's centre. Runs much wider than a candle (price labels, buttons)
+    and runs that do not sit on the grid are ignored.
+
+    Returns the spacing, the position of candle 0, and the grid index of each candle.
+    """
+    mask = strong_counts > 0
+    edges = np.diff(np.r_[0, mask.astype(int), 0])
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1) - 1
+    if len(starts) < 3:
+        raise ValueError("No candles found in this screenshot. Try a screenshot of the chart.")
+
+    widths = ends - starts + 1
+    centres = (starts + ends) / 2.0
+    typical_width = np.percentile(widths, 75)
+    fits = widths <= 2.5 * max(typical_width, 3)   # candles share one width; labels and buttons do not
+    centres, widths = centres[fits], widths[fits]
+    if len(centres) < 3:
+        raise ValueError("No candles found in this screenshot. Try a screenshot of the chart.")
+
+    diffs = np.diff(centres)
+    typical = np.median(diffs)
+    single = diffs[(diffs > 0.75 * typical) & (diffs < 1.25 * typical)]   # gaps of exactly one candle
+    touching = "Candles touch each other in this screenshot. Use fewer bars or a wider chart."
+    if single.size < 3:
+        raise ValueError(touching)
+    rough = single.mean()   # sub-pixel: whole-pixel gaps average out to the true spacing
+
+    index = np.round((centres - centres[0]) / rough)
+    inlier = np.ones(len(centres), dtype=bool)
+    for _ in range(4):
+        design = np.c_[np.ones(inlier.sum()), index[inlier]]
+        (offset, period), *_ = np.linalg.lstsq(design, centres[inlier], rcond=None)
+        inlier = np.abs(centres - (offset + period * index)) < 0.25 * period
+
+    if np.median(widths[inlier]) >= 0.95 * period:
+        raise ValueError(touching)
+    return float(period), float(offset), index[inlier].astype(int)
+
+
+def _price_band(solid):
+    """
+    Find the price pane: the top-most block of rows that holds a substantial share of the
+    candle colour. Volume bars and indicator panes sit below it, separated by blank rows.
+    """
+    groups = _row_groups(solid.sum(axis=1) > 0, max_gap=12)
+    if not groups:
+        raise ValueError("No green or red candles found. Try a screenshot of the candles.")
+    totals = [int(solid[top:bottom + 1].sum()) for top, bottom in groups]
+    biggest = max(totals)
+    for (top, bottom), total in zip(groups, totals):   # ordered top to bottom
+        if total >= 0.3 * biggest:
+            return top, bottom
+    return groups[0]
+
+
 def read_candles(image_bytes):
     """
-    Turn a chart screenshot into OHLC candles, left to right.
+    Turn a chart screenshot into OHLC candles, oldest first.
 
-    Candles are assumed to sit at a regular spacing, as on standard price charts.
-    Each candle is read from its own slot, so touching candles are kept apart.
     Prices are relative: 1.0 at the top edge of the image and 0.0 at the bottom.
-    Strategies only use candle shape, so the absolute price level is not needed.
+    The strategies only use candle shape, so the absolute price level is not needed.
     """
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         raise ValueError("That file is not an image the scanner can read. Use PNG, JPG or WEBP.")
 
-    hsv = np.asarray(img.convert("HSV")).astype(int)
-    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]   # Pillow HSV: each channel 0-255
-    vivid = (sat >= 90) & (val >= 60)                       # ignores grey, white and dark backgrounds
-    green = vivid & (hue >= 60) & (hue <= 140)
-    red = vivid & ((hue <= 15) | (hue >= 235))
-    colored = green | red
+    green, red, solid = _colour_masks(img)
+    full_height = solid.shape[0]
+    band_top, band_bottom = _price_band(solid)
+    green = green[band_top:band_bottom + 1]
+    red = red[band_top:band_bottom + 1]
+    solid = solid[band_top:band_bottom + 1]
+    width = solid.shape[1]
 
-    height, width = colored.shape
-    col_counts = colored.sum(axis=0)
-    strong_counts = np.where(col_counts >= 3, col_counts, 0)  # wicks and bodies; ignores 1-2 px dotted lines
+    col_counts = solid.sum(axis=0)                             # candle cores find the candle columns
+    strong_counts = np.where(col_counts >= 3, col_counts, 0)   # wicks and bodies; ignores 1-2 px lines
     if strong_counts.max() == 0:
-        return pd.DataFrame(columns=["open", "high", "low", "close"])
+        raise ValueError("No green or red candles found. Try a screenshot of the candles.")
 
-    period, phase = _candle_grid(strong_counts)
+    period, offset, grid = _fit_grid(strong_counts)
 
-    def to_price(y):
-        return 1.0 - y / (height - 1)
+    def to_price(y_abs):
+        return 1.0 - y_abs / (full_height - 1)
 
     candles = []
-    for centre in np.arange(phase, width, period):
-        # Only columns whose centre lies inside this candle's slot. Rounding outwards
-        # would pick up the edge of a neighbouring candle.
+    for k in range(int(grid.min()), int(grid.max()) + 1):
+        centre = offset + period * k
+        # Only columns whose centre lies inside this candle's slot.
         x0 = max(0, int(np.ceil(centre - period / 2 + 1e-9)))
         x1 = min(width, int(np.floor(centre + period / 2 - 1e-9)) + 1)
         if x1 <= x0:
@@ -456,19 +359,18 @@ def read_candles(image_bytes):
         g = green[:, x0:x1]
         r = red[:, x0:x1]
         both = g | r
-        if both.sum(axis=0).max() < 3:  # no wick or body in this slot
+        if solid[:, x0:x1].sum(axis=0).max() < 2:   # no candle in this slot (a 2 px doji still counts)
             continue
 
         # The body is the block of wide rows around the widest row. The wick is the
-        # contiguous run of coloured rows above and below it, so stray pixels elsewhere
-        # in the slot (such as a dotted price line) do not stretch the candle.
+        # contiguous run of coloured rows above and below it.
         runs = _longest_run(both)
         peak_row = int(np.argmax(runs))
         peak = runs[peak_row]
         body_top, body_bottom = _grow(runs >= max(min(2, peak), 0.75 * peak), peak_row)
         present = both.any(axis=1)
-        high_y = _grow(present, body_top)[0]
-        low_y = _grow(present, body_bottom)[1]
+        high_y = _grow(present, body_top, max_gap=3)[0]
+        low_y = _grow(present, body_bottom, max_gap=3)[1]
 
         body_green = g[body_top:body_bottom + 1].sum()
         body_red = r[body_top:body_bottom + 1].sum()
@@ -478,121 +380,68 @@ def read_candles(image_bytes):
             open_y, close_y = body_top, body_bottom
 
         candles.append({
-            "open": to_price(open_y),
-            "high": to_price(high_y),
-            "low": to_price(low_y),
-            "close": to_price(close_y),
+            "open": to_price(open_y + band_top),
+            "high": to_price(high_y + band_top),
+            "low": to_price(low_y + band_top),
+            "close": to_price(close_y + band_top),
         })
 
+    if not candles:
+        raise ValueError("No green or red candles found. Try a screenshot of the candles.")
     return pd.DataFrame(candles, columns=["open", "high", "low", "close"])
 
 
 # ---------------------------------------------------------------------------
-# Analysis
+# Signal
 # ---------------------------------------------------------------------------
-def latest_vote(signals):
-    """A strategy's vote is its most recent trigger within VOTE_LOOKBACK candles."""
-    recent = signals.iloc[-VOTE_LOOKBACK:]
-    fired = recent[recent != 0]
-    return int(fired.iloc[-1]) if len(fired) else 0
-
-
-def backtest(df, signals, atr_series):
-    """Enter at each signal's close; exit at stop or target in ATR units (stop wins ties)."""
-    highs = df["high"].to_numpy()
-    lows = df["low"].to_numpy()
-    closes = df["close"].to_numpy()
-    atrs = atr_series.to_numpy()
-    sig = signals.to_numpy()
-    wins = losses = 0
-
-    for i in np.flatnonzero(sig):
-        if np.isnan(atrs[i]):
-            continue
-        side, entry = sig[i], closes[i]
-        stop = entry - side * STOP_ATR * atrs[i]
-        target = entry + side * TARGET_ATR * atrs[i]
-        for j in range(i + 1, min(i + 1 + BACKTEST_HORIZON, len(df))):
-            stop_hit = lows[j] <= stop if side == 1 else highs[j] >= stop
-            target_hit = highs[j] >= target if side == 1 else lows[j] <= target
-            if stop_hit:
-                losses += 1
-                break
-            if target_hit:
-                wins += 1
-                break
-
-    trades = wins + losses
-    return {
-        "trades": trades,
-        "wins": wins,
-        "win_rate": round(100 * wins / trades, 1) if trades else None,
-    }
-
-
 def analyze(df):
     if len(df) < MIN_CANDLES:
-        raise ValueError(
-            f"Found {len(df)} candles. The scanner needs at least {MIN_CANDLES}. "
-            "Use a screenshot with more bars."
-        )
+        raise ValueError("Not enough candles in this screenshot. Use a screenshot with more bars.")
 
-    atr_series = atr(df)
-    rows = []
-    for name, family, fn in STRATEGIES:
-        signals = fn(df).fillna(0).astype(int)
-        rows.append({
-            "name": name,
-            "category": family,
-            "vote": latest_vote(signals),
-            "backtest": backtest(df, signals, atr_series),
-        })
+    strategies = read_strategies(df)
+    total = len(strategies)
+    buy = sum(s["vote"] == 1 for s in strategies)
+    sell = sum(s["vote"] == -1 for s in strategies)
+    neutral = total - buy - sell
+    lead = max(buy, sell)
+    other = min(buy, sell)
+    confidence = round(100 * lead / total)
 
-    total = len(rows)
-    buy_votes = sum(r["vote"] == 1 for r in rows)
-    sell_votes = sum(r["vote"] == -1 for r in rows)
-    neutral = total - buy_votes - sell_votes
-
-    direction = 0 if buy_votes == sell_votes else (1 if buy_votes > sell_votes else -1)
-    agreeing = max(buy_votes, sell_votes)
-    confidence = round(100 * agreeing / total, 1)
-    dissenting = sell_votes if direction == 1 else buy_votes
-
-    if direction == 0:
-        signal, reason = "HOLD", "Buy and sell votes are tied."
-    elif confidence < MIN_CONFIDENCE:
-        signal = "HOLD"
-        reason = f"Only {agreeing} of {total} strategies agree. {MIN_CONFIDENCE}% is required."
+    if buy == sell:
+        signal, reason = "HOLD", "Buy and sell readings are level."
     else:
-        signal = "BUY" if direction == 1 else "SELL"
-        reason = f"{agreeing} of {total} strategies agree on {signal}."
-        if dissenting:
-            reason += f" {dissenting} voted the other way."
+        word = "BUY" if buy > sell else "SELL"
+        if lead >= MIN_AGREE and other <= MAX_DISSENT:
+            signal = word
+            reason = f"{lead} of {total} strategies point {word.lower()}."
+            if other:
+                reason += f" {other} voted the other way."
+        elif lead < MIN_AGREE:
+            signal = "HOLD"
+            reason = f"Only {lead} of {total} strategies point {word.lower()}. {MIN_AGREE} are needed."
+        else:
+            signal = "HOLD"
+            reason = f"Strategies are split: {lead} {word.lower()}, {other} the other way."
 
-    last = df.iloc[-1]
+    newest = df.iloc[-1]
     return {
         "signal": signal,
         "reason": reason,
         "confidence": confidence,
-        "buy_votes": buy_votes,
-        "sell_votes": sell_votes,
+        "buy_votes": buy,
+        "sell_votes": sell,
         "neutral": neutral,
-        "candles": len(df),
-        "last_candle": "Bullish" if last["close"] >= last["open"] else "Bearish",
+        "newest_candle": "Bullish" if newest["close"] >= newest["open"] else "Bearish",
         "stop_atr": STOP_ATR,
         "target_atr": TARGET_ATR,
         "reward_risk": round(TARGET_ATR / STOP_ATR, 2),
-        "strategies": rows,
+        "strategies": strategies,
     }
 
 
 # ---------------------------------------------------------------------------
 # Web app
 # ---------------------------------------------------------------------------
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
-
-
 @app.get("/")
 def home():
     return PAGE
@@ -604,12 +453,7 @@ def scan():
         upload = request.files.get("image")
         if not upload or not upload.filename:
             raise ValueError("Upload a chart screenshot.")
-
-        df = read_candles(upload.read())
-        if df.empty:
-            raise ValueError("No green or red candles found. Try a screenshot of the candles only.")
-
-        return jsonify(analyze(df))
+        return jsonify(analyze(read_candles(upload.read())))
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except Exception:
@@ -624,6 +468,11 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>Chart Scanner</title>
+<meta name="theme-color" content="#070b14">
+<link rel="icon" href="/static/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="manifest" href="/static/manifest.webmanifest">
 <style>
 :root{
   --bg:#070b14;--panel:#0d1424;--panel-2:#09101e;--line:#1a2539;--track:#17223a;
@@ -691,6 +540,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:22px 16px
 .ring .val{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600}
 
 .facts{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.facts.three{grid-template-columns:repeat(3,1fr)}
 .fact{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
 .fact span{display:block;font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)}
 .fact b{display:block;margin-top:2px;font-family:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;font-size:13px;font-weight:600}
@@ -699,6 +549,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:22px 16px
 .section h3{margin:0;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:600}
 .section small{font-size:10px;color:var(--muted)}
 .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.grid .tile:last-child:nth-child(odd){grid-column:1 / -1}
 .tile{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:11px 12px;animation:rise .4s both}
 .tile-top{display:flex;justify-content:space-between;align-items:center}
 .fam{font-size:10px;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted)}
@@ -706,16 +557,14 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:22px 16px
 .chip.buy{color:var(--buy);border-color:rgba(43,217,139,.4);background:rgba(43,217,139,.08)}
 .chip.sell{color:var(--sell);border-color:rgba(255,77,109,.4);background:rgba(255,77,109,.08)}
 .chip.flat{color:var(--muted);border-color:var(--line)}
-.tile-name{margin:7px 0 9px;font-size:13px;font-weight:500}
-.bt{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted)}
-.bt-bar{flex:1;height:4px;border-radius:4px;background:var(--track);overflow:hidden}
-.bt-bar span{display:block;height:100%;background:var(--accent)}
-.bt .mono{color:var(--text)}
+.tile-name{margin:7px 0 4px;font-size:13px;font-weight:500}
+.reading{font-size:12px;color:var(--muted);line-height:1.4}
 
 .foot{margin:22px 0 0;text-align:center;font-size:11px;color:var(--muted)}
 
 @media(max-width:600px){
   .facts{grid-template-columns:repeat(2,1fr)}
+  .facts.three{grid-template-columns:repeat(3,1fr)}
   .grid{grid-template-columns:1fr}
   .drop{height:260px}
 }
@@ -736,7 +585,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:22px 16px
     </svg>
     <span>Chart Scanner</span>
   </div>
-  <div class="meta">20 strategies</div>
+  <div class="meta">5 strategies</div>
 </header>
 
 <main>
@@ -753,12 +602,12 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:22px 16px
       <div class="beam"></div>
     </div>
   </label>
-  <p class="hint">Candles only. Leave out the price scale and volume panes.</p>
+  <p class="hint">Use a screenshot of the chart. Green and red candles are read.</p>
   <p id="status" class="status"></p>
 
   <section id="results" class="results" hidden></section>
 
-  <p class="foot">Educational tool, not financial advice. Backtests are simplified and past results do not guarantee future ones.</p>
+  <p class="foot">Educational tool, not financial advice. ATR is the average candle range. Past readings do not guarantee future ones.</p>
 </main>
 
 <script>
@@ -816,7 +665,7 @@ async function scan(file) {
   drop.classList.add("scanning");
   results.hidden = true;
   results.innerHTML = "";
-  setStatus("Reading candles and running 20 strategies", "");
+  setStatus("Reading the chart", "");
 
   const body = new FormData();
   body.append("image", file);
@@ -839,15 +688,10 @@ function render(d) {
 
   const tiles = d.strategies.map((s, i) => {
     const [label, tone] = VOTE[String(s.vote)];
-    const wr = s.backtest.win_rate;
-    return `<div class="tile" style="animation-delay:${i * 35}ms">
-      <div class="tile-top"><span class="fam">${esc(s.category)}</span><span class="chip ${tone}">${label}</span></div>
+    return `<div class="tile" style="animation-delay:${i * 40}ms">
+      <div class="tile-top"><span class="fam">${esc(s.family)}</span><span class="chip ${tone}">${label}</span></div>
       <div class="tile-name">${esc(s.name)}</div>
-      <div class="bt">
-        <div class="bt-bar"><span style="width:${wr ?? 0}%"></span></div>
-        <span class="mono">${wr === null ? "n/a" : wr.toFixed(1) + "%"}</span>
-        <span class="mono">${s.backtest.trades} trades</span>
-      </div>
+      <div class="reading">${esc(s.reading)}</div>
     </div>`;
   }).join("");
 
@@ -865,7 +709,7 @@ function render(d) {
             <circle class="arc" cx="38" cy="38" r="34" stroke-dasharray="${RING}"
               stroke-dashoffset="${RING}" data-target="${RING * (1 - pct / 100)}"></circle>
           </svg>
-          <div class="val mono">${pct.toFixed(0)}%</div>
+          <div class="val mono">${pct}%</div>
         </div>
       </div>
     </div>
@@ -874,11 +718,10 @@ function render(d) {
       <div class="fact"><span>Buy votes</span><b>${d.buy_votes}</b></div>
       <div class="fact"><span>Sell votes</span><b>${d.sell_votes}</b></div>
       <div class="fact"><span>Neutral</span><b>${d.neutral}</b></div>
-      <div class="fact"><span>Last candle</span><b>${esc(d.last_candle)}</b></div>
+      <div class="fact"><span>Newest candle</span><b>${esc(d.newest_candle)}</b></div>
     </div>
 
-    <div class="facts">
-      <div class="fact"><span>Candles read</span><b>${d.candles}</b></div>
+    <div class="facts three">
       <div class="fact"><span>Stop</span><b>${d.stop_atr} ATR</b></div>
       <div class="fact"><span>Target</span><b>${d.target_atr} ATR</b></div>
       <div class="fact"><span>Reward : risk</span><b>1 : ${d.reward_risk}</b></div>
@@ -887,7 +730,7 @@ function render(d) {
     <div class="card">
       <div class="section">
         <h3>Strategies</h3>
-        <small>backtest win rate and trades</small>
+        <small>current state of the chart</small>
       </div>
       <div class="grid">${tiles}</div>
     </div>`;
