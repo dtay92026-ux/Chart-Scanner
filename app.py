@@ -1,19 +1,16 @@
 """
 AlgoD Scanner
 =============
-A chart scanner. The only input is a chart screenshot.
+A chart scanner. The only input is a chart screenshot. Nothing is sent to any outside service.
 
-  1. A vision model reads the candles and the price axis from the picture.
+  1. The chart reader finds the price and time axes (Tesseract OCR) and the candles (pixel analysis).
   2. Five rule-based strategies look at the latest candles and vote.
   3. The scanner shows the signal, the levels, and how many strategies agree.
 
-The rules are deterministic. The AI only reads the picture; it never decides a trade.
-The same screenshot always returns the same result, because results are cached by the
-file's hash and the vision model runs at temperature 0.
+The reader refuses charts it cannot read exactly (for example candles packed too closely together),
+and says why. It never guesses. The same screenshot always gives the same result (cached by hash).
 
-Environment variables
-    ANTHROPIC_API_KEY     required to read screenshots
-    ANTHROPIC_MODEL       vision model (default claude-sonnet-5-5)
+Environment variables (all optional)
     CHART_GMT_OFFSET      GMT offset of the chart's clock (default 2)
     MIN_AGREE             strategies that must agree before a signal is shown (default 3 of 5)
     ACCESS_PIN            optional PIN that must be entered before scanning
@@ -43,6 +40,8 @@ from datetime import date, datetime, timedelta, timezone
 
 from flask import Flask, Response, jsonify, request
 
+import reader as chart_reader
+
 try:
     from PIL import Image
 except Exception:  # Pillow is optional; the image is then sent as uploaded
@@ -53,8 +52,7 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 BRAND = os.environ.get("BRAND_NAME", "AlgoD Scanner").strip() or "AlgoD Scanner"
 ACCESS_PIN = os.environ.get("ACCESS_PIN", "").strip()
-API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5").strip()
+MODEL = "local-reader-1"  # part of the cache key; bump when the reader changes
 SCAN_LIMIT = int(os.environ.get("SCAN_LIMIT_PER_HOUR", "30") or 30)
 CHART_GMT = int(os.environ.get("CHART_GMT_OFFSET", "2") or 2)
 MIN_AGREE = max(1, int(os.environ.get("MIN_AGREE", "3") or 3))
@@ -174,110 +172,8 @@ def guess_digits(p):
     return 2
 
 
-VISION_PROMPT = """You are a chart digitiser. The image is a screenshot of a financial price chart (candlesticks or OHLC bars).
-Read the chart and return ONLY one JSON object, with no commentary and no markdown fences.
-
-Schema:
-{
-  "readable": true or false,
-  "quality": "high" | "medium" | "low",
-  "symbol": string or null,
-  "timeframe": "M1"|"M5"|"M15"|"M30"|"H1"|"H4"|"D1"|"W1" or null,
-  "scale": "actual" or "normalized",
-  "calibration": [{"y": number, "price": number}, {"y": number, "price": number}] or null,
-  "first_candle_time": "YYYY-MM-DD HH:MM" or null,
-  "last_candle_time": "YYYY-MM-DD HH:MM" or null,
-  "candles": [[open, high, low, close], ...],
-  "notes": string
-}
-
-Rules:
-- "candles" are the most recent fully visible candles (up to 100), ordered oldest to newest. The rightmost candle is last.
-- If the price axis labels let you read real prices reliably, use scale "actual" and give real prices, with calibration null.
-- Otherwise use scale "normalized": y runs from 0 at the bottom of the plotted area to 100 at the top. If you can read at least two price labels on the axis, also give "calibration": two points that pair a normalized y with the price shown at that height.
-- Ignore indicators, moving averages, drawn lines, volume bars and text overlays. Do not treat them as candles.
-- Keep every candle consistent: high >= max(open, close) and low <= min(open, close).
-- Take the timeframe and times from the chart title or the time axis only if they are clearly legible; otherwise use null. Times are exactly as displayed.
-- Never invent candles. If fewer than 40 candles can be distinguished, or the image is not a price chart, return {"readable": false, "notes": "reason"}.
-"""
-
-
 class VisionError(Exception):
-    pass
-
-
-def prepare_image(raw):
-    """Validate and shrink the upload. Returns (bytes, media_type)."""
-    if Image is None:
-        if len(raw) > 4_500_000:
-            raise VisionError("Image is too large. Upload a smaller screenshot.")
-        mt = "image/png" if raw[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
-        return raw, mt
-    try:
-        im = Image.open(io.BytesIO(raw))
-        im.load()
-    except Exception:
-        raise VisionError("That file is not a readable image.")
-    if im.mode not in ("RGB", "L"):
-        bg = Image.new("RGB", im.size, (0, 0, 0))
-        try:
-            bg.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[-1])
-            im = bg
-        except Exception:
-            im = im.convert("RGB")
-    elif im.mode == "L":
-        im = im.convert("RGB")
-    longest = max(im.size)
-    if longest > 1800:
-        scale = 1800.0 / longest
-        im = im.resize((int(im.size[0] * scale), int(im.size[1] * scale)), Image.LANCZOS)
-    buf = io.BytesIO()
-    im.save(buf, "PNG", optimize=True)
-    data = buf.getvalue()
-    if len(data) > 4_800_000:
-        buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=88)
-        return buf.getvalue(), "image/jpeg"
-    return data, "image/png"
-
-
-def extract_json(text):
-    a, b = text.find("{"), text.rfind("}")
-    if a < 0 or b <= a:
-        raise VisionError("The vision model did not return readable data.")
-    try:
-        return json.loads(text[a:b + 1])
-    except json.JSONDecodeError:
-        raise VisionError("The vision model returned malformed data. Try again.")
-
-
-def call_vision(img, media_type):
-    body = {
-        "model": MODEL, "max_tokens": 8000, "temperature": 0,
-        "messages": [{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(img).decode()}},
-            {"type": "text", "text": VISION_PROMPT}]}],
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=json.dumps(body).encode("utf-8"), method="POST",
-        headers={"content-type": "application/json", "x-api-key": API_KEY, "anthropic-version": "2023-06-01"})
-    try:
-        with urllib.request.urlopen(req, timeout=110) as r:
-            data = json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
-        except Exception:
-            msg = ""
-        if e.code == 401:
-            raise VisionError("The server's Anthropic API key was rejected. Check ANTHROPIC_API_KEY.")
-        if e.code == 429:
-            raise VisionError("The vision service is rate limited right now. Try again shortly.")
-        raise VisionError("Vision service error (%s). %s" % (e.code, msg[:160]))
-    except Exception as e:
-        raise VisionError("Could not reach the vision service: %s" % (str(e)[:120]))
-    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-    return extract_json(text)
+    """A screenshot that cannot be read exactly. The message is shown to the user as-is."""
 
 
 def bars_from_vision(js, tf_override=None):
@@ -1001,7 +897,7 @@ def _cache_put(key, value):
 
 @app.route("/api/config")
 def api_config():
-    return no_store(jsonify({"brand": BRAND, "vision": bool(API_KEY), "pin": bool(ACCESS_PIN), "version": VERSION,
+    return no_store(jsonify({"brand": BRAND, "reader": chart_reader.ocr_available(), "pin": bool(ACCESS_PIN), "version": VERSION,
                              "strategies": STRATEGY_COUNT, "min_agree": MIN_AGREE}))
 
 
@@ -1026,21 +922,20 @@ def api_scan():
     if hit is not None:
         return no_store(jsonify(dict(hit, cached=True)))
 
-    if not API_KEY:
-        return jsonify({"ok": False, "code": "no_key",
-                        "error": "Chart reading is not configured on this server."}), 503
+    if not chart_reader.ocr_available():
+        return jsonify({"ok": False, "code": "no_ocr",
+                        "error": "The chart reader is not installed on this server."}), 503
     if not rate_ok("scan", SCAN_LIMIT):
         return jsonify({"ok": False, "error": "The scan limit for this hour has been reached. Try again later."}), 429
     try:
-        img, mt = prepare_image(raw)
-        js = call_vision(img, mt)
+        js = chart_reader.read_chart(raw)
         bars, m = bars_from_vision(js)
         if m.get("scale") != "actual":
             raise VisionError("The price scale could not be read, so no levels can be shown. "
                               "Upload a screenshot where the price axis is visible.")
         x = Ctx(bars, CHART_GMT, m["tf_min"], m["digits"], "actual", m["has_times"])
         res = make_result(x, x.n - 1, m)
-    except VisionError as e:
+    except (VisionError, chart_reader.ChartError) as e:
         return jsonify({"ok": False, "error": str(e)}), 422
     _cache_put(key, res)
     return no_store(jsonify(dict(res, cached=False)))
@@ -1165,7 +1060,7 @@ body{background:#000;color:var(--tx);font:12px/1.5 var(--sans);-webkit-font-smoo
       <div class="scan"></div>
     </div>
     <div class="cap">Upload chart</div>
-    <div class="hint">PNG or JPG screenshot with the price axis visible</div>
+    <div class="hint">PNG or JPG screenshot, zoomed so the candles are clearly separated</div>
     <input id="file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
     <div class="err" id="err"></div>
   </section>
@@ -1216,7 +1111,7 @@ function loadConfig(){
     var first=parts[0]||'';var rest=parts.slice(1).join(' ');
     $('brand').appendChild(document.createTextNode(first));
     if(rest){$('brand').appendChild(document.createTextNode(' '));var b=el('b','',rest);$('brand').appendChild(b);}
-    if(!c.vision){setStatus('err','Offline');showErr('Chart reading is not configured on this server.');}
+    if(!c.reader){setStatus('err','Offline');showErr('The chart reader is not installed on this server.');}
     else if(c.pin&&!pin){setStatus('','Locked');$('pinRow').hidden=false;}
     else setStatus('ok','Ready');
   }).catch(function(){setStatus('err','Offline');});
@@ -1245,7 +1140,7 @@ function scan(file){
   }).then(function(x){
     busy(false);
     if(x.status===401){pin='';sessionStorage.removeItem('scan_pin');$('pinRow').hidden=false;setStatus('','Locked');showErr('Incorrect PIN.');return;}
-    if(!x.body||!x.body.ok){showErr((x.body&&x.body.error)||'The chart could not be scanned.');setStatus(cfg&&cfg.vision?'ok':'err',cfg&&cfg.vision?'Ready':'Offline');return;}
+    if(!x.body||!x.body.ok){showErr((x.body&&x.body.error)||'The chart could not be scanned.');setStatus(cfg&&cfg.reader?'ok':'err',cfg&&cfg.reader?'Ready':'Offline');return;}
     setStatus('ok','Ready');render(x.body);
   }).catch(function(){busy(false);setStatus('err','Offline');showErr('Could not reach the server. Try again.');});
 }
@@ -1262,6 +1157,7 @@ function render(r){
   for(var k=0;k<total;k++){var sp=el('span',(k<top?'on '+(dir||'none'):''));seg.appendChild(sp);}
   $('pct').textContent=(s.confidence||0)+'%';
   $('readTop').textContent=[r.symbol,r.timeframe].filter(Boolean).join(' \u00b7 ')||'';
+  $('readTop').style.textTransform='none';
   var p=r.plan;
   if(p){
     $('plan').hidden=false;
