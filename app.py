@@ -1,807 +1,1325 @@
 """
-Chart Scanner
+AlgoD Scanner
 =============
-Upload a chart screenshot. The app reads the green and red candles from the
-image and checks five widely used strategies on the chart as it is now.
+A chart scanner. The only input is a chart screenshot.
 
-  * Each strategy reads the current state of the chart and votes BUY, SELL or
-    NEUTRAL. Votes do not depend on crossovers from earlier in the chart.
-  * Neutral bands mean a small move cannot flip a vote.
-  * Confidence = share of the five strategies that agree.
-  * A BUY or SELL needs at least MIN_AGREE agreeing and at most MAX_DISSENT
-    dissenting. Otherwise the signal is HOLD.
+  1. A vision model reads the candles and the price axis from the picture.
+  2. Five rule-based strategies look at the latest candles and vote.
+  3. The scanner shows the signal, the levels, and how many strategies agree.
 
-Only the uploaded screenshot is used. No prices or data are fetched.
-Educational use only. This is not financial advice.
+The rules are deterministic. The AI only reads the picture; it never decides a trade.
+The same screenshot always returns the same result, because results are cached by the
+file's hash and the vision model runs at temperature 0.
+
+Environment variables
+    ANTHROPIC_API_KEY     required to read screenshots
+    ANTHROPIC_MODEL       vision model (default claude-sonnet-5-5)
+    CHART_GMT_OFFSET      GMT offset of the chart's clock (default 2)
+    MIN_AGREE             strategies that must agree before a signal is shown (default 3 of 5)
+    ACCESS_PIN            optional PIN that must be entered before scanning
+    SCAN_LIMIT_PER_HOUR   new screenshots per visitor per hour (default 30; cached results are free)
+    BRAND_NAME            name shown in the header (default "AlgoD Scanner")
+    PORT                  listen port (default 5000)
+
+Run with one worker, because the result cache lives in memory:
+    gunicorn -w 1 --threads 4 -t 150 -b 0.0.0.0:$PORT app:app
 """
-
+import base64
+import hashlib
+import hmac
 import io
-import mimetypes
+import json
+import math
+import os
+import re
+import statistics
+import threading
+import time
+import urllib.error
+import urllib.request
+from bisect import bisect_left, bisect_right
+from collections import OrderedDict
+from datetime import date, datetime, timedelta, timezone
 
-import numpy as np
-import pandas as pd
-from flask import Flask, jsonify, request
-from PIL import Image
+from flask import Flask, Response, jsonify, request
 
-mimetypes.add_type("application/manifest+json", ".webmanifest")
-
-
-# ---------------------------------------------------------------------------
-# Settings
-# ---------------------------------------------------------------------------
-MIN_CANDLES = 60       # indicators need this many candles to settle
-MIN_AGREE = 3          # strategies that must point the same way for a signal
-MAX_DISSENT = 1        # strategies allowed to point the other way
-ATR_PERIOD = 14
-STOP_ATR = 1.5         # stop distance, in ATR units (the average candle range)
-TARGET_ATR = 2.5       # target distance, in ATR units
-MAX_UPLOAD_MB = 10
+try:
+    from PIL import Image
+except Exception:  # Pillow is optional; the image is then sent as uploaded
+    Image = None
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+
+BRAND = os.environ.get("BRAND_NAME", "AlgoD Scanner").strip() or "AlgoD Scanner"
+ACCESS_PIN = os.environ.get("ACCESS_PIN", "").strip()
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5").strip()
+SCAN_LIMIT = int(os.environ.get("SCAN_LIMIT_PER_HOUR", "30") or 30)
+CHART_GMT = int(os.environ.get("CHART_GMT_OFFSET", "2") or 2)
+MIN_AGREE = max(1, int(os.environ.get("MIN_AGREE", "3") or 3))
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
+MIN_SCAN_BARS = 60
+VERSION = "2.0"
+DEBUG_RAISE = False  # tests set this to surface strategy exceptions
+CACHE_SIZE = 200
+STRATEGY_COUNT = 5
+
+_lock = threading.Lock()
+_hits = {}
+_fails = {}
 
 
-# ---------------------------------------------------------------------------
-# Indicators
-# ---------------------------------------------------------------------------
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
+# ============================================================ access control
+def client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    return fwd or request.remote_addr or "?"
 
 
-def atr(df, n=ATR_PERIOD):
-    prev_close = df["close"].shift()
-    true_range = pd.concat(
-        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
-        axis=1,
-    ).max(axis=1)
-    return true_range.ewm(alpha=1 / n, adjust=False).mean()
+def rate_ok(bucket, limit, window=3600):
+    now = time.time()
+    key = (bucket, client_ip())
+    with _lock:
+        arr = [t for t in _hits.get(key, []) if now - t < window]
+        if len(arr) >= limit:
+            _hits[key] = arr
+            return False
+        arr.append(now)
+        _hits[key] = arr
+    return True
 
 
-def rsi(close, n=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    return (100 - 100 / (1 + gain / loss)).fillna(50.0)
+def gate():
+    if not ACCESS_PIN:
+        return None
+    ip = client_ip()
+    t = time.time()
+    recent = [x for x in _fails.get(ip, []) if t - x < 300]
+    if len(recent) >= 8:
+        _fails[ip] = recent
+        return jsonify({"ok": False, "error": "Too many attempts. Try again in a few minutes."}), 429
+    given = request.headers.get("X-Access-Pin", "")
+    if given and hmac.compare_digest(given.encode("utf-8"), ACCESS_PIN.encode("utf-8")):
+        return None
+    if given:
+        recent.append(t)
+    _fails[ip] = recent
+    return jsonify({"ok": False, "error": "locked"}), 401
 
 
-def macd(close, fast=12, slow=26, signal=9):
-    line = ema(close, fast) - ema(close, slow)
-    return line, ema(line, signal)
+def no_store(resp):
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
-def adx(df, n=14):
-    up = df["high"].diff()
-    down = -df["low"].diff()
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    smoothed_atr = atr(df, n)
-    plus_di = (100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / smoothed_atr).fillna(0.0)
-    minus_di = (100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / smoothed_atr).fillna(0.0)
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0.0)
-    return dx.ewm(alpha=1 / n, adjust=False).mean(), plus_di, minus_di
+
+# ================================================================= data input
+_DT_FORMATS = [
+    "%Y.%m.%d %H:%M:%S", "%Y.%m.%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
+    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d", "%Y.%m.%d",
+]
+TF_MINUTES = {"M1": 1, "M2": 2, "M3": 3, "M5": 5, "M10": 10, "M15": 15, "M30": 30, "H1": 60, "H2": 120,
+              "H4": 240, "D1": 1440, "W1": 10080}
+TF_SNAP = [1, 2, 3, 5, 10, 15, 30, 60, 120, 240, 1440, 10080]
 
 
-def supertrend(df, n=10, mult=3.0):
-    """Returns (trend, line): trend is +1 above the Supertrend line and -1 below it."""
-    band = mult * atr(df, n).to_numpy()
-    hl2 = ((df["high"] + df["low"]) / 2).to_numpy()
-    basic_up, basic_dn = hl2 + band, hl2 - band
-    close = df["close"].to_numpy()
-    up, dn = basic_up.copy(), basic_dn.copy()
-    trend = np.ones(len(df), dtype=int)
-    for i in range(1, len(df)):
-        up[i] = basic_up[i] if (basic_up[i] < up[i - 1] or close[i - 1] > up[i - 1]) else up[i - 1]
-        dn[i] = basic_dn[i] if (basic_dn[i] > dn[i - 1] or close[i - 1] < dn[i - 1]) else dn[i - 1]
-        if trend[i - 1] == 1 and close[i] < dn[i]:
-            trend[i] = -1
-        elif trend[i - 1] == -1 and close[i] > up[i]:
-            trend[i] = 1
-        else:
-            trend[i] = trend[i - 1]
-    line = np.where(trend == 1, dn, up)
-    return pd.Series(trend, index=df.index), pd.Series(line, index=df.index)
+def tf_label(m):
+    for k, v in TF_MINUTES.items():
+        if v == m:
+            return k
+    return None
 
 
-# ---------------------------------------------------------------------------
-# The five strategies. Each reads the chart as it is now, including the newest
-# candle, and returns BUY (1), SELL (-1) or NEUTRAL (0) with a short reading.
-# Thresholds are in ATR units or fixed levels, so they do not depend on price.
-# ---------------------------------------------------------------------------
-def read_strategies(df):
-    close = df["close"]
-    unit = float(atr(df).iloc[-1])
-    readings = []
-
-    # 1. Moving average trend: price and the 20 and 50 averages stacked in order.
-    e20, e50 = ema(close, 20), ema(close, 50)
-    c, a20, a50 = float(close.iloc[-1]), float(e20.iloc[-1]), float(e50.iloc[-1])
-    if c > a20 > a50 and a20 - a50 >= 0.2 * unit:
-        vote, text = 1, "Price is above the 20 and 50 averages, and the 20 is above the 50"
-    elif c < a20 < a50 and a50 - a20 >= 0.2 * unit:
-        vote, text = -1, "Price is below the 20 and 50 averages, and the 20 is below the 50"
-    else:
-        vote, text = 0, "The averages are mixed or too close to call"
-    readings.append(("Moving average trend", "Trend", vote, text))
-
-    # 2. Supertrend: which side of the trailing ATR line price is on.
-    trend, line_st = supertrend(df)
-    st, st_line = int(trend.iloc[-1]), float(line_st.iloc[-1])
-    if abs(c - st_line) < 0.1 * unit:
-        vote, text = 0, "Price is too close to the Supertrend line to call"
-    elif st == 1:
-        vote, text = 1, "Price is above the Supertrend line"
-    else:
-        vote, text = -1, "Price is below the Supertrend line"
-    readings.append(("Supertrend", "Trend", vote, text))
-
-    # 3. MACD: the line must sit on one side of zero and clearly on one side of its signal.
-    line, signal_line = macd(close)
-    m_now, s_now = float(line.iloc[-1]), float(signal_line.iloc[-1])
-    if m_now > 0 and m_now - s_now >= 0.05 * unit:
-        vote, text = 1, "MACD is above zero and above its signal line"
-    elif m_now < 0 and s_now - m_now >= 0.05 * unit:
-        vote, text = -1, "MACD is below zero and below its signal line"
-    else:
-        vote, text = 0, "MACD is mixed or flat"
-    readings.append(("MACD", "Momentum", vote, text))
-
-    # 4. RSI zones: a neutral band between 45 and 55 keeps small moves from flipping it.
-    r = float(rsi(close).iloc[-1])
-    if r >= 55:
-        vote, text = 1, f"RSI {r:.0f}, bullish zone"
-    elif r <= 45:
-        vote, text = -1, f"RSI {r:.0f}, bearish zone"
-    else:
-        vote, text = 0, f"RSI {r:.0f}, neutral zone"
-    readings.append(("RSI zone", "Momentum", vote, text))
-
-    # 5. ADX direction: a trend must be strong enough, and one side must lead clearly.
-    adx_v, plus_di, minus_di = adx(df)
-    v, p_di, m_di = float(adx_v.iloc[-1]), float(plus_di.iloc[-1]), float(minus_di.iloc[-1])
-    if v >= 25 and p_di - m_di >= 5:
-        vote, text = 1, f"ADX {v:.0f}, strong upward trend"
-    elif v >= 25 and m_di - p_di >= 5:
-        vote, text = -1, f"ADX {v:.0f}, strong downward trend"
-    elif v >= 20:
-        vote, text = 0, f"ADX {v:.0f}, trend forming"
-    else:
-        vote, text = 0, f"ADX {v:.0f}, no clear trend"
-    readings.append(("ADX direction", "Trend strength", vote, text))
-
-    return [
-        {"name": name, "family": family, "vote": int(vote), "reading": text}
-        for name, family, vote, text in readings
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Reading candles from a screenshot
-# ---------------------------------------------------------------------------
-def _colour_masks(img):
-    """
-    Find green and red pixels. The chart background is the most common colour, and a
-    pixel counts as coloured when it is far enough from that background. Testing the
-    distance from the background, rather than a brightness threshold, keeps thin wicks
-    and blurred edges (JPEG) readable. Channel ratios keep out cyan, blue and orange lines.
-    """
-    rgb = np.asarray(img).astype(np.int16)
-    coarse = (rgb // 16).reshape(-1, 3)
-    codes = coarse[:, 0] * 256 + coarse[:, 1] * 16 + coarse[:, 2]
-    values, counts = np.unique(codes, return_counts=True)
-    most_common = int(values[np.argmax(counts)])
-    background = np.array([most_common // 256, (most_common // 16) % 16, most_common % 16]) * 16 + 8
-
-    distance = np.sqrt(((rgb - background) ** 2).sum(axis=2).astype(float))
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    is_green = (g >= 1.2 * r) & (g >= b - 10) & (g - r >= 25)
-    is_red = (r >= 1.6 * g) & (r - b >= 25) & (r - g >= 40)
-    green = (distance >= 50) & is_green
-    red = (distance >= 50) & is_red
-    solid = ((distance >= 110) & is_green) | ((distance >= 110) & is_red)   # bright cores only
-    # Drop pixels with no coloured neighbour above or below. Candle bodies and wicks are
-    # vertical, so they keep their pixels, but dotted or dashed price lines do not.
-    above = np.zeros_like(solid)
-    above[1:] = solid[:-1]
-    below = np.zeros_like(solid)
-    below[:-1] = solid[1:]
-    solid = solid & (above | below)
-    return green, red, solid
-
-
-def _longest_run(mask):
-    """Longest horizontal run of True pixels in each row of a small mask."""
-    run = np.zeros(mask.shape[0], dtype=int)
-    best = np.zeros(mask.shape[0], dtype=int)
-    for x in range(mask.shape[1]):
-        run = (run + 1) * mask[:, x]
-        best = np.maximum(best, run)
-    return best
-
-
-def _row_groups(present, max_gap=2):
-    """
-    Groups of coloured rows, as (top, bottom). Gaps of up to max_gap rows stay inside one
-    group, because compression can break a wick into pieces. One-pixel-tall groups (dotted
-    price lines) are dropped.
-    """
-    edges = np.diff(np.r_[0, present.astype(int), 0])
-    starts = np.flatnonzero(edges == 1)
-    ends = np.flatnonzero(edges == -1) - 1
-    groups = []
-    for s, e in zip(starts, ends):
-        if groups and s - groups[-1][1] - 1 <= max_gap:
-            groups[-1] = (groups[-1][0], int(e))
-        else:
-            groups.append((int(s), int(e)))
-    return [(s, e) for s, e in groups if e - s + 1 >= 2]
-
-
-def _grow(mask, seed, max_gap=0):
-    """
-    Return the (top, bottom) rows of the block of True rows that contains seed.
-    Gaps of up to max_gap rows do not end the block, because compression can
-    break a thin wick into pieces.
-    """
-    def walk(step):
-        position = last_true = seed
-        while True:
-            nxt = position + step
-            if nxt < 0 or nxt >= len(mask):
-                break
-            if mask[nxt]:
-                position = last_true = nxt
-            elif abs(nxt - last_true) <= max_gap:
-                position = nxt
-            else:
-                break
-        return last_true
-
-    return walk(-1), walk(1)
-
-
-def _fit_grid(strong_counts):
-    """
-    Find the candle grid. Each run of coloured columns is one candle, so its middle
-    is that candle's centre. Runs much wider than a candle (price labels, buttons)
-    and runs that do not sit on the grid are ignored.
-
-    Returns the spacing, the position of candle 0, and the grid index of each candle.
-    """
-    mask = strong_counts > 0
-    edges = np.diff(np.r_[0, mask.astype(int), 0])
-    starts = np.flatnonzero(edges == 1)
-    ends = np.flatnonzero(edges == -1) - 1
-    if len(starts) < 3:
-        raise ValueError("No candles found in this screenshot. Try a screenshot of the chart.")
-
-    widths = ends - starts + 1
-    centres = (starts + ends) / 2.0
-    typical_width = np.percentile(widths, 75)
-    fits = widths <= 2.5 * max(typical_width, 3)   # candles share one width; labels and buttons do not
-    centres, widths = centres[fits], widths[fits]
-    if len(centres) < 3:
-        raise ValueError("No candles found in this screenshot. Try a screenshot of the chart.")
-
-    diffs = np.diff(centres)
-    typical = np.median(diffs)
-    single = diffs[(diffs > 0.75 * typical) & (diffs < 1.25 * typical)]   # gaps of exactly one candle
-    touching = "Candles touch each other in this screenshot. Use fewer bars or a wider chart."
-    if single.size < 3:
-        raise ValueError(touching)
-    rough = single.mean()   # sub-pixel: whole-pixel gaps average out to the true spacing
-
-    index = np.round((centres - centres[0]) / rough)
-    inlier = np.ones(len(centres), dtype=bool)
-    for _ in range(4):
-        design = np.c_[np.ones(inlier.sum()), index[inlier]]
-        (offset, period), *_ = np.linalg.lstsq(design, centres[inlier], rcond=None)
-        inlier = np.abs(centres - (offset + period * index)) < 0.25 * period
-
-    if np.median(widths[inlier]) >= 0.95 * period:
-        raise ValueError(touching)
-    return float(period), float(offset), index[inlier].astype(int)
-
-
-def _price_band(solid):
-    """
-    Find the price pane: the top-most block of rows that holds a substantial share of the
-    candle colour. Volume bars and indicator panes sit below it, separated by blank rows.
-    """
-    groups = _row_groups(solid.sum(axis=1) > 0, max_gap=12)
-    if not groups:
-        raise ValueError("No green or red candles found. Try a screenshot of the candles.")
-    totals = [int(solid[top:bottom + 1].sum()) for top, bottom in groups]
-    biggest = max(totals)
-    for (top, bottom), total in zip(groups, totals):   # ordered top to bottom
-        if total >= 0.3 * biggest:
-            return top, bottom
-    return groups[0]
-
-
-def read_candles(image_bytes):
-    """
-    Turn a chart screenshot into OHLC candles, oldest first.
-
-    Prices are relative: 1.0 at the top edge of the image and 0.0 at the bottom.
-    The strategies only use candle shape, so the absolute price level is not needed.
-    """
+def parse_dt(s):
+    s = str(s).strip().replace("Z", "")
+    if re.fullmatch(r"\d{10}", s):
+        return datetime.fromtimestamp(int(s), timezone.utc).replace(tzinfo=None)
+    if re.fullmatch(r"\d{13}", s):
+        return datetime.fromtimestamp(int(s) / 1000.0, timezone.utc).replace(tzinfo=None)
+    for f in _DT_FORMATS:
+        try:
+            return datetime.strptime(s, f)
+        except ValueError:
+            continue
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        return datetime.fromisoformat(s).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _num(s):
+    return float(str(s).strip().replace(" ", ""))
+
+
+def infer_tf(times):
+    if not times or len(times) < 5 or any(t is None for t in times):
+        return None
+    deltas = [(times[k + 1] - times[k]).total_seconds() / 60.0 for k in range(min(len(times) - 1, 400))]
+    deltas = [d for d in deltas if d > 0]
+    if not deltas:
+        return None
+    med = statistics.median(deltas)
+    best = min(TF_SNAP, key=lambda v: abs(v - med))
+    return best if abs(best - med) <= 0.25 * best else None
+
+
+def guess_digits(p):
+    p = abs(p)
+    if p < 10:
+        return 5
+    if p < 500:
+        return 3
+    return 2
+
+
+VISION_PROMPT = """You are a chart digitiser. The image is a screenshot of a financial price chart (candlesticks or OHLC bars).
+Read the chart and return ONLY one JSON object, with no commentary and no markdown fences.
+
+Schema:
+{
+  "readable": true or false,
+  "quality": "high" | "medium" | "low",
+  "symbol": string or null,
+  "timeframe": "M1"|"M5"|"M15"|"M30"|"H1"|"H4"|"D1"|"W1" or null,
+  "scale": "actual" or "normalized",
+  "calibration": [{"y": number, "price": number}, {"y": number, "price": number}] or null,
+  "first_candle_time": "YYYY-MM-DD HH:MM" or null,
+  "last_candle_time": "YYYY-MM-DD HH:MM" or null,
+  "candles": [[open, high, low, close], ...],
+  "notes": string
+}
+
+Rules:
+- "candles" are the most recent fully visible candles (up to 100), ordered oldest to newest. The rightmost candle is last.
+- If the price axis labels let you read real prices reliably, use scale "actual" and give real prices, with calibration null.
+- Otherwise use scale "normalized": y runs from 0 at the bottom of the plotted area to 100 at the top. If you can read at least two price labels on the axis, also give "calibration": two points that pair a normalized y with the price shown at that height.
+- Ignore indicators, moving averages, drawn lines, volume bars and text overlays. Do not treat them as candles.
+- Keep every candle consistent: high >= max(open, close) and low <= min(open, close).
+- Take the timeframe and times from the chart title or the time axis only if they are clearly legible; otherwise use null. Times are exactly as displayed.
+- Never invent candles. If fewer than 40 candles can be distinguished, or the image is not a price chart, return {"readable": false, "notes": "reason"}.
+"""
+
+
+class VisionError(Exception):
+    pass
+
+
+def prepare_image(raw):
+    """Validate and shrink the upload. Returns (bytes, media_type)."""
+    if Image is None:
+        if len(raw) > 4_500_000:
+            raise VisionError("Image is too large. Upload a smaller screenshot.")
+        mt = "image/png" if raw[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+        return raw, mt
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im.load()
     except Exception:
-        raise ValueError("That file is not an image the scanner can read. Use PNG, JPG or WEBP.")
-
-    green, red, solid = _colour_masks(img)
-    full_height = solid.shape[0]
-    band_top, band_bottom = _price_band(solid)
-    green = green[band_top:band_bottom + 1]
-    red = red[band_top:band_bottom + 1]
-    solid = solid[band_top:band_bottom + 1]
-    width = solid.shape[1]
-
-    col_counts = solid.sum(axis=0)                             # candle cores find the candle columns
-    strong_counts = np.where(col_counts >= 3, col_counts, 0)   # wicks and bodies; ignores 1-2 px lines
-    if strong_counts.max() == 0:
-        raise ValueError("No green or red candles found. Try a screenshot of the candles.")
-
-    period, offset, grid = _fit_grid(strong_counts)
-
-    def to_price(y_abs):
-        return 1.0 - y_abs / (full_height - 1)
-
-    candles = []
-    for k in range(int(grid.min()), int(grid.max()) + 1):
-        centre = offset + period * k
-        # Only columns whose centre lies inside this candle's slot.
-        x0 = max(0, int(np.ceil(centre - period / 2 + 1e-9)))
-        x1 = min(width, int(np.floor(centre + period / 2 - 1e-9)) + 1)
-        if x1 <= x0:
-            continue
-        g = green[:, x0:x1]
-        r = red[:, x0:x1]
-        both = g | r
-        if solid[:, x0:x1].sum(axis=0).max() < 2:   # no candle in this slot (a 2 px doji still counts)
-            continue
-
-        # The body is the block of wide rows around the widest row. The wick is the
-        # contiguous run of coloured rows above and below it.
-        runs = _longest_run(both)
-        peak_row = int(np.argmax(runs))
-        peak = runs[peak_row]
-        body_top, body_bottom = _grow(runs >= max(min(2, peak), 0.75 * peak), peak_row)
-        present = both.any(axis=1)
-        high_y = _grow(present, body_top, max_gap=3)[0]
-        low_y = _grow(present, body_bottom, max_gap=3)[1]
-
-        body_green = g[body_top:body_bottom + 1].sum()
-        body_red = r[body_top:body_bottom + 1].sum()
-        if body_green >= body_red:
-            open_y, close_y = body_bottom, body_top
-        else:
-            open_y, close_y = body_top, body_bottom
-
-        candles.append({
-            "open": to_price(open_y + band_top),
-            "high": to_price(high_y + band_top),
-            "low": to_price(low_y + band_top),
-            "close": to_price(close_y + band_top),
-        })
-
-    if not candles:
-        raise ValueError("No green or red candles found. Try a screenshot of the candles.")
-    return pd.DataFrame(candles, columns=["open", "high", "low", "close"])
+        raise VisionError("That file is not a readable image.")
+    if im.mode not in ("RGB", "L"):
+        bg = Image.new("RGB", im.size, (0, 0, 0))
+        try:
+            bg.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[-1])
+            im = bg
+        except Exception:
+            im = im.convert("RGB")
+    elif im.mode == "L":
+        im = im.convert("RGB")
+    longest = max(im.size)
+    if longest > 1800:
+        scale = 1800.0 / longest
+        im = im.resize((int(im.size[0] * scale), int(im.size[1] * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, "PNG", optimize=True)
+    data = buf.getvalue()
+    if len(data) > 4_800_000:
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=88)
+        return buf.getvalue(), "image/jpeg"
+    return data, "image/png"
 
 
-# ---------------------------------------------------------------------------
-# Signal
-# ---------------------------------------------------------------------------
-def analyze(df):
-    if len(df) < MIN_CANDLES:
-        raise ValueError("Not enough candles in this screenshot. Use a screenshot with more bars.")
+def extract_json(text):
+    a, b = text.find("{"), text.rfind("}")
+    if a < 0 or b <= a:
+        raise VisionError("The vision model did not return readable data.")
+    try:
+        return json.loads(text[a:b + 1])
+    except json.JSONDecodeError:
+        raise VisionError("The vision model returned malformed data. Try again.")
 
-    strategies = read_strategies(df)
-    total = len(strategies)
-    buy = sum(s["vote"] == 1 for s in strategies)
-    sell = sum(s["vote"] == -1 for s in strategies)
-    neutral = total - buy - sell
-    lead = max(buy, sell)
-    other = min(buy, sell)
-    confidence = round(100 * lead / total)
 
-    if buy == sell:
-        signal, reason = "HOLD", "Buy and sell readings are level."
-    else:
-        word = "BUY" if buy > sell else "SELL"
-        if lead >= MIN_AGREE and other <= MAX_DISSENT:
-            signal = word
-            reason = f"{lead} of {total} strategies point {word.lower()}."
-            if other:
-                reason += f" {other} voted the other way."
-        elif lead < MIN_AGREE:
-            signal = "HOLD"
-            reason = f"Only {lead} of {total} strategies point {word.lower()}. {MIN_AGREE} are needed."
-        else:
-            signal = "HOLD"
-            reason = f"Strategies are split: {lead} {word.lower()}, {other} the other way."
-
-    newest = df.iloc[-1]
-    return {
-        "signal": signal,
-        "reason": reason,
-        "confidence": confidence,
-        "buy_votes": buy,
-        "sell_votes": sell,
-        "neutral": neutral,
-        "newest_candle": "Bullish" if newest["close"] >= newest["open"] else "Bearish",
-        "stop_atr": STOP_ATR,
-        "target_atr": TARGET_ATR,
-        "reward_risk": round(TARGET_ATR / STOP_ATR, 2),
-        "strategies": strategies,
+def call_vision(img, media_type):
+    body = {
+        "model": MODEL, "max_tokens": 8000, "temperature": 0,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(img).decode()}},
+            {"type": "text", "text": VISION_PROMPT}]}],
     }
-
-
-# ---------------------------------------------------------------------------
-# Web app
-# ---------------------------------------------------------------------------
-@app.get("/")
-def home():
-    return PAGE
-
-
-@app.post("/api/scan")
-def scan():
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"content-type": "application/json", "x-api-key": API_KEY, "anthropic-version": "2023-06-01"})
     try:
-        upload = request.files.get("image")
-        if not upload or not upload.filename:
-            raise ValueError("Upload a chart screenshot.")
-        return jsonify(analyze(read_candles(upload.read())))
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
-    except Exception:
-        app.logger.exception("Scan failed")
-        return jsonify(error="Scan failed. Try a clearer screenshot."), 500
+        with urllib.request.urlopen(req, timeout=110) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:
+            msg = ""
+        if e.code == 401:
+            raise VisionError("The server's Anthropic API key was rejected. Check ANTHROPIC_API_KEY.")
+        if e.code == 429:
+            raise VisionError("The vision service is rate limited right now. Try again shortly.")
+        raise VisionError("Vision service error (%s). %s" % (e.code, msg[:160]))
+    except Exception as e:
+        raise VisionError("Could not reach the vision service: %s" % (str(e)[:120]))
+    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    return extract_json(text)
 
 
-PAGE = """<!doctype html>
+def bars_from_vision(js, tf_override=None):
+    if not js.get("readable"):
+        raise VisionError("Could not read this chart: %s" % (js.get("notes") or "no candles found") )
+    raw = js.get("candles") or []
+    out = []
+    for c in raw:
+        try:
+            o, h, l, cl = (float(v) for v in c[:4])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not all(math.isfinite(v) for v in (o, h, l, cl)):
+            continue
+        out.append([o, max(h, o, cl), min(l, o, cl), cl])
+    if len(out) < MIN_SCAN_BARS:
+        raise VisionError("Only %d candles could be read; at least %d are needed. Zoom out so more candles are visible, then upload again." % (len(out), MIN_SCAN_BARS))
+    out = out[-300:]
+    scale = js.get("scale") if js.get("scale") in ("actual", "normalized") else "normalized"
+    cal = js.get("calibration")
+    digits = 1
+    if scale == "normalized" and isinstance(cal, list) and len(cal) >= 2:
+        try:
+            y1, p1, y2, p2 = float(cal[0]["y"]), float(cal[0]["price"]), float(cal[1]["y"]), float(cal[1]["price"])
+            if abs(y2 - y1) > 5 and p1 != p2:
+                k = (p2 - p1) / (y2 - y1)
+                out = [[p1 + (v - y1) * k for v in row] for row in out]
+                scale = "actual"
+        except (KeyError, TypeError, ValueError):
+            pass
+    if scale == "actual":
+        digits = guess_digits(out[-1][3])
+    tf = js.get("timeframe") if js.get("timeframe") in TF_MINUTES else None
+    if tf_override in TF_MINUTES:
+        tf = tf_override
+    tf_min = TF_MINUTES.get(tf)
+    times = [None] * len(out)
+    times_note = "No readable time axis"
+    t0, t1 = parse_dt(js.get("first_candle_time") or ""), parse_dt(js.get("last_candle_time") or "")
+    n_read = len(js.get("candles") or [])
+    if t1 and tf_min:
+        n = len(out)
+        span = (n - 1) * tf_min
+        if t0 and n_read == n:
+            actual = (t1 - t0).total_seconds() / 60.0
+            if abs(actual - span) <= 0.12 * span + tf_min:
+                times = [t1 - timedelta(minutes=tf_min * (n - 1 - k)) for k in range(n)]
+                times_note = "Times reconstructed from the time axis"
+            else:
+                times_note = "Time axis spans a weekend or gap, so session timing was not used"
+        elif not t0:
+            times = [t1 - timedelta(minutes=tf_min * (n - 1 - k)) for k in range(n)]
+            times_note = "Times reconstructed from the last candle (not cross-checked)"
+    bars = [{"t": times[k], "o": r[0], "h": r[1], "l": r[2], "c": r[3]} for k, r in enumerate(out)]
+    meta = {"digits": digits, "scale": scale, "tf_min": tf_min, "has_times": times[-1] is not None,
+            "symbol": js.get("symbol"), "quality": js.get("quality") or "medium", "notes": js.get("notes") or "",
+            "times_note": times_note, "tf": tf_label(tf_min) if tf_min else None}
+    return bars, meta
+
+
+# ================================================================== indicators
+def ema_l(v, n):
+    L = len(v)
+    out = [None] * L
+    if L < n:
+        return out
+    k = 2.0 / (n + 1)
+    e = sum(v[:n]) / n
+    out[n - 1] = e
+    for i in range(n, L):
+        e = v[i] * k + e * (1 - k)
+        out[i] = e
+    return out
+
+
+def atr_w(h, l, c, n=14):
+    L = len(c)
+    out = [None] * L
+    tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, L)]
+    if L <= n:
+        return out
+    a = sum(tr[1:n + 1]) / n
+    out[n] = a
+    for i in range(n + 1, L):
+        a = (a * (n - 1) + tr[i]) / n
+        out[i] = a
+    return out
+
+
+def rsi_w(c, n=14):
+    L = len(c)
+    out = [None] * L
+    if L <= n:
+        return out
+    g = ls = 0.0
+    for i in range(1, n + 1):
+        d = c[i] - c[i - 1]
+        g += max(d, 0)
+        ls += max(-d, 0)
+    ag, al = g / n, ls / n
+    out[n] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    for i in range(n + 1, L):
+        d = c[i] - c[i - 1]
+        ag = (ag * (n - 1) + max(d, 0)) / n
+        al = (al * (n - 1) + max(-d, 0)) / n
+        out[i] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def adx_w(h, l, c, n=14):
+    L = len(c)
+    adx, pdi, mdi = [None] * L, [None] * L, [None] * L
+    if L < 2 * n + 2:
+        return adx, pdi, mdi
+    tr, pdm, mdm = [0.0] * L, [0.0] * L, [0.0] * L
+    for i in range(1, L):
+        up, dn = h[i] - h[i - 1], l[i - 1] - l[i]
+        pdm[i] = up if (up > dn and up > 0) else 0.0
+        mdm[i] = dn if (dn > up and dn > 0) else 0.0
+        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+    a_, p_, m_ = sum(tr[1:n + 1]), sum(pdm[1:n + 1]), sum(mdm[1:n + 1])
+    dx = [None] * L
+    for i in range(n, L):
+        if i > n:
+            a_ = a_ - a_ / n + tr[i]
+            p_ = p_ - p_ / n + pdm[i]
+            m_ = m_ - m_ / n + mdm[i]
+        pdi[i] = 100 * p_ / a_ if a_ > 0 else 0.0
+        mdi[i] = 100 * m_ / a_ if a_ > 0 else 0.0
+        s = pdi[i] + mdi[i]
+        dx[i] = 100 * abs(pdi[i] - mdi[i]) / s if s > 0 else 0.0
+    st = 2 * n - 1
+    adx[st] = sum(dx[n:2 * n]) / n
+    for i in range(st + 1, L):
+        adx[i] = (adx[i - 1] * (n - 1) + dx[i]) / n
+    return adx, pdi, mdi
+
+
+def boll(c, n=20, k=2.0):
+    L = len(c)
+    mid, up, lo = [None] * L, [None] * L, [None] * L
+    for i in range(n - 1, L):
+        w = c[i - n + 1:i + 1]
+        m = sum(w) / n
+        sd = math.sqrt(sum((x - m) ** 2 for x in w) / n)
+        mid[i], up[i], lo[i] = m, m + k * sd, m - k * sd
+    return mid, up, lo
+
+
+def find_swings(h, l, k=3):
+    n = len(h)
+    sh, sl = [], []
+    for j in range(k, n - k):
+        hj, lj = h[j], l[j]
+        if all(hj > h[j - m] for m in range(1, k + 1)) and all(hj >= h[j + m] for m in range(1, k + 1)):
+            sh.append((j + k, j, hj))
+        if all(lj < l[j - m] for m in range(1, k + 1)) and all(lj <= l[j + m] for m in range(1, k + 1)):
+            sl.append((j + k, j, lj))
+    return sh, sl
+
+
+# ---------------------------------------------------------------- sessions
+def _nth_weekday(year, month, weekday, n):
+    if n > 0:
+        d = date(year, month, 1)
+        d += timedelta(days=(weekday - d.weekday()) % 7 + 7 * (n - 1))
+        return d
+    nxt = date(year + (month == 12), (month % 12) + 1, 1)
+    d = nxt - timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+
+def uk_offset(d):
+    return 1 if _nth_weekday(d.year, 3, 6, -1) <= d < _nth_weekday(d.year, 10, 6, -1) else 0
+
+
+def us_offset(d):
+    return -4 if _nth_weekday(d.year, 3, 6, 2) <= d < _nth_weekday(d.year, 11, 6, 1) else -5
+
+
+class Ctx:
+    """Pre-computed indicators for one price series. Strategies read data at index i only."""
+
+    def __init__(self, bars, server_gmt=0, tf_min=None, digits=2, scale="actual", has_times=True):
+        self.bars = bars
+        self.n = len(bars)
+        self.o = [b["o"] for b in bars]
+        self.h = [b["h"] for b in bars]
+        self.l = [b["l"] for b in bars]
+        self.c = [b["c"] for b in bars]
+        self.t = [b["t"] for b in bars]
+        self.has_times = bool(has_times) and all(t is not None for t in self.t)
+        self.u = [t - timedelta(hours=server_gmt) for t in self.t] if self.has_times else None
+        self.tf_min = tf_min
+        self.intraday = bool(self.has_times and tf_min and tf_min <= 60)
+        self.digits = digits
+        self.scale = scale
+        self.warm = 55
+        self.atr = atr_w(self.h, self.l, self.c)
+        self.ema9 = ema_l(self.c, 9)
+        self.ema21 = ema_l(self.c, 21)
+        self.macd, self.macd_sig = macd_lines(self.c)
+        self.atr10 = atr_w(self.h, self.l, self.c, 10)
+        self.st_line, self.st_dir = supertrend(self.h, self.l, self.c, self.atr10, 3.0)
+        self.ema20 = ema_l(self.c, 20)
+        self.ema50 = ema_l(self.c, 50)
+        self.rsi = rsi_w(self.c)
+        self.adx, self.pdi, self.mdi = adx_w(self.h, self.l, self.c)
+        self.bbm, self.bbu, self.bbl = boll(self.c)
+        self.bbw = [((self.bbu[i] - self.bbl[i]) / self.atr[i]) if (self.bbu[i] is not None and self.atr[i]) else None
+                    for i in range(self.n)]
+        self.sh, self.sl = find_swings(self.h, self.l, 3)
+        self.sh_conf = [s[0] for s in self.sh]
+        self.sl_conf = [s[0] for s in self.sl]
+        self._days = {}
+
+    # -- formatting
+    def fp(self, v):
+        if self.scale == "actual":
+            return "{:,.{d}f}".format(v, d=self.digits)
+        return "{:.1f}".format(v)
+
+    # -- swings (confirmed at or before i), newest first: [(index, price), ...]
+    def sw(self, kind, i, cnt=2):
+        conf, lst = (self.sh_conf, self.sh) if kind == "H" else (self.sl_conf, self.sl)
+        pos = bisect_right(conf, i)
+        return [(s[1], s[2]) for s in reversed(lst[max(0, pos - cnt):pos])]
+
+    # -- support / resistance clusters from confirmed swings
+    def levels(self, i, lookback=150, tol=0.35, min_touches=2):
+        a = self.atr[i]
+        if not a:
+            return []
+        pts = []
+        for conf, lst in ((self.sh_conf, self.sh), (self.sl_conf, self.sl)):
+            pos = bisect_right(conf, i)
+            for s in lst[:pos]:
+                if s[1] >= i - lookback:
+                    pts.append((s[2], s[1]))
+        pts.sort()
+        clusters = []
+        for price, idx in pts:
+            if clusters and price - clusters[-1][-1][0] <= tol * a:
+                clusters[-1].append((price, idx))
+            else:
+                clusters.append([(price, idx)])
+        out = []
+        for cl in clusters:
+            if len(cl) >= min_touches:
+                out.append({"price": sum(p for p, _ in cl) / len(cl), "touches": len(cl), "last": max(k for _, k in cl)})
+        return out
+
+    # -- sessions (UTC)
+    def day(self, i):
+        d = self.u[i].date()
+        info = self._days.get(d)
+        if info is None:
+            uk, us = uk_offset(d), us_offset(d)
+            mid = datetime(d.year, d.month, d.day)
+            info = {
+                "asia_s": mid, "lon_o": mid + timedelta(hours=8 - uk), "lon_c": mid + timedelta(hours=17 - uk),
+                "ny_pre": mid + timedelta(hours=8 - us), "ny_data": mid + timedelta(hours=8.5 - us),
+                "ny_o": mid + timedelta(hours=9.5 - us), "ny_c": mid + timedelta(hours=17 - us),
+            }
+            self._days[d] = info
+        return info
+
+    def at(self, dt):
+        return bisect_left(self.u, dt)
+
+    def covers(self, dt0):
+        return self.u[0] <= dt0 + timedelta(minutes=(self.tf_min or 15) * 1.5)
+
+
+def R(sig, ev, sl=None, tp=None, pat=None, forming=False):
+    return {"sig": sig, "ev": ev, "sl": sl, "tp": tp, "pat": pat, "forming": forming}
+
+
+def NA(reason):
+    return {"sig": "NA", "ev": reason, "sl": None, "tp": None, "pat": None, "forming": False}
+
+
+def _hi(x, i, n):
+    return max(x.h[i - n + 1:i + 1])
+
+
+def _lo(x, i, n):
+    return min(x.l[i - n + 1:i + 1])
+
+
+# ================================================================ strategies
+STRATS = []
+
+
+def strat(sid, name, group, desc, needs_time=False):
+    def deco(fn):
+        STRATS.append({"id": sid, "name": name, "group": group, "desc": desc, "needs_time": needs_time, "fn": fn})
+        return fn
+    return deco
+
+
+def _session_ready(x):
+    if not x.has_times:
+        return "Needs candle times (not readable from this chart)"
+    if not x.intraday:
+        return "Needs an intraday timeframe (1 hour or lower)"
+    return None
+
+
+def _asian_range(x, i, info):
+    """Asian range [00:00 UTC, London open). Returns (i0, i1, hi, lo) or an NA result."""
+    if not x.covers(info["asia_s"]):
+        return NA("The Asian session is not fully visible on this chart")
+    i0, i1 = x.at(info["asia_s"]), x.at(info["lon_o"])
+    if i1 - i0 < 6 or i1 > i:
+        return NA("Not enough Asian-session candles on the chart")
+    return i0, i1, max(x.h[i0:i1]), min(x.l[i0:i1])
+
+
+
+
+# ============================================================== five strategies
+# Each strategy reads the latest closed candles and only fires on a fresh event:
+# the newest candle, or the one before it. The newest candle counts as the current state.
+
+NYA_SWEEP_PTS = 3       # the wick must pierce the New York level by this many EA points
+NYA_SL_PTS = 15         # the stop sits this many EA points beyond the sweep wick
+NYA_MIN_RR = 1.0        # the opposite New York level must be at least this many R away
+NYA_FALLBACK_RR = 3.0   # otherwise the target is 3R
+GMT2 = timedelta(hours=2)  # the New York / Asian rules are written on a GMT+2 clock
+
+
+def ea_point(x):
+    """One point as AlgoD.mq5 counts it: 10 broker points on 3- and 5-digit symbols."""
+    return (10.0 ** -x.digits) * (10 if x.digits in (3, 5) else 1)
+
+
+def gmt2_clock(x):
+    return [u + GMT2 for u in x.u]
+
+
+@strat("ny_asia", "NY Levels Sweep", "Session",
+       "Marks the high and low of the New York final hours, 20:00-23:00 GMT+2. When the Asian session "
+       "(00:00-07:00 GMT+2) wicks beyond one of those levels by 3 points, it trades that candle: stop 15 points "
+       "beyond the wick, target the opposite New York level, or 3R if that level is too close. One trade per session.",
+       True)
+def s_ny_asia(x, i):
+    why = _session_ready(x)
+    if why:
+        return NA(why)
+    loc = gmt2_clock(x)
+    t = loc[i]
+    a0 = datetime(t.year, t.month, t.day)
+    if not (a0 <= t < a0 + timedelta(hours=7)):
+        return NA("Outside the Asian sweep window (00:00-07:00 GMT+2)")
+    tf = x.tf_min or 15
+    ny0, ny1 = a0 - timedelta(hours=4), a0 - timedelta(hours=1)
+    ny = [k for k in range(i + 1) if ny0 <= loc[k] < ny1]
+    if len(ny) < max(3, int(0.6 * 180 / tf)) or loc[ny[-1]] < ny1 - timedelta(minutes=2 * tf):
+        return NA("The New York final hours are not fully visible on this chart")
+    nyh = max(x.h[k] for k in ny)
+    nyl = min(x.l[k] for k in ny)
+    levels = "NY high %s / NY low %s" % (x.fp(nyh), x.fp(nyl))
+    asia = [k for k in range(i + 1) if a0 <= loc[k] <= t]
+    point = ea_point(x)
+    buf = NYA_SWEEP_PTS * point
+    up = next((k for k in asia if x.h[k] >= nyh + buf), None)
+    dn = next((k for k in asia if x.l[k] <= nyl - buf), None)
+    if up is None and dn is None:
+        return R("NEUTRAL", "%s not swept in this Asian session yet." % levels)
+    if up is not None and dn is not None and up == dn:
+        return R("NEUTRAL", "Both New York levels were wicked on one candle. Ambiguous, so no trade.")
+    sell = up is not None and (dn is None or up < dn)
+    s = up if sell else dn
+    if s < i - 1:
+        return R("NEUTRAL", "The sweep came earlier in this session. One trade per session, so no new entry.")
+    entry = x.c[s]
+    ext = max(x.h[s:i + 1]) if sell else min(x.l[s:i + 1])
+    stop_gap = NYA_SL_PTS * point
+    sl = ext + stop_gap if sell else ext - stop_gap
+    risk = (sl - entry) if sell else (entry - sl)
+    if risk <= 0:
+        return R("NEUTRAL", "No valid stop could be placed beyond the sweep.")
+    if s == i - 1 and abs(x.c[i] - entry) > 0.5 * risk:
+        return R("NEUTRAL", "Price has moved on from the sweep candle. The entry is no longer fresh.")
+    d = -1 if sell else 1
+    opp = nyl if sell else nyh
+    dist = (entry - opp) if sell else (opp - entry)
+    if dist >= NYA_MIN_RR * risk:
+        tp, note = opp, "target the opposite New York level %s" % x.fp(opp)
+    else:
+        tp, note = entry + d * NYA_FALLBACK_RR * risk, "opposite level too close, so 3R"
+    cur = x.c[i]
+    if (sell and cur <= tp) or (not sell and cur >= tp):
+        return R("NEUTRAL", "Price has already reached the target.")
+    if sell:
+        ev = "Wick above the NY high (%s) in Asia. Stop above the wick, %s." % (x.fp(nyh), note)
+    else:
+        ev = "Wick below the NY low (%s) in Asia. Stop below the wick, %s." % (x.fp(nyl), note)
+    return R("SELL" if sell else "BUY", ev, sl, tp)
+
+
+def _cross(a, b, k):
+    """True when series a crosses above b (up) or below b (down) at candle k."""
+    return a[k - 1] is not None and b[k - 1] is not None and a[k] is not None and b[k] is not None
+
+
+@strat("ema_cross", "EMA 9/21 Cross", "Trend",
+       "EMA(9) crosses EMA(21) on one of the latest two candles, in the direction of the EMA(50). "
+       "Stop 1.5 ATR, target 2R.")
+def s_ema_cross(x, i):
+    if i < 60:
+        return NA("Not enough history")
+    up = any(_cross(x.ema9, x.ema21, k) and x.ema9[k - 1] <= x.ema21[k - 1] and x.ema9[k] > x.ema21[k] for k in (i - 1, i))
+    dn = any(_cross(x.ema9, x.ema21, k) and x.ema9[k - 1] >= x.ema21[k - 1] and x.ema9[k] < x.ema21[k] for k in (i - 1, i))
+    if up == dn:
+        return R("NEUTRAL", "No EMA 9/21 cross on the last two candles.")
+    d = 1 if up else -1
+    c, a = x.c[i], x.atr[i]
+    if (c - x.ema50[i]) * d <= 0:
+        return R("NEUTRAL", "The cross runs against the EMA 50 trend, so it is skipped.")
+    return R("BUY" if up else "SELL",
+             "EMA 9 crossed %s EMA 21 on the trend side of EMA 50." % ("above" if up else "below"),
+             c - d * 1.5 * a, c + d * 3.0 * a)
+
+
+@strat("rsi_reversal", "RSI Extreme Reversal", "Momentum",
+       "RSI(14) leaves an extreme (below 30 or above 70) on one of the latest two candles, and a candle confirms "
+       "the turn. Stop beyond the 3-candle extreme plus 0.1 ATR, target 2R.")
+def s_rsi_reversal(x, i):
+    if i < 60:
+        return NA("Not enough history")
+    up = any(x.rsi[k - 1] < 30 <= x.rsi[k] and x.c[k] > x.o[k] for k in (i - 1, i))
+    dn = any(x.rsi[k - 1] > 70 >= x.rsi[k] and x.c[k] < x.o[k] for k in (i - 1, i))
+    if up == dn:
+        return R("NEUTRAL", "RSI %.0f: no exit from an extreme with a confirming candle." % x.rsi[i])
+    c, a = x.c[i], x.atr[i]
+    if up:
+        sl = min(x.l[i - 3:i + 1]) - 0.1 * a
+        risk = c - sl
+        if risk <= 0:
+            return R("NEUTRAL", "No valid stop could be placed.")
+        return R("BUY", "RSI left oversold (below 30) and turned up on a bullish candle.", sl, c + 2 * risk)
+    sl = max(x.h[i - 3:i + 1]) + 0.1 * a
+    risk = sl - c
+    if risk <= 0:
+        return R("NEUTRAL", "No valid stop could be placed.")
+    return R("SELL", "RSI left overbought (above 70) and turned down on a bearish candle.", sl, c - 2 * risk)
+
+
+@strat("macd_cross", "MACD Cross", "Momentum",
+       "MACD(12,26,9) crosses its signal line on one of the latest two candles, in the direction of the EMA(50). "
+       "Stop 1.5 ATR, target 2R.")
+def s_macd_cross(x, i):
+    if i < 60:
+        return NA("Not enough history")
+    up = any(x.macd[k - 1] is not None and x.macd_sig[k - 1] is not None and x.macd_sig[k] is not None
+             and x.macd[k - 1] <= x.macd_sig[k - 1] and x.macd[k] > x.macd_sig[k] for k in (i - 1, i))
+    dn = any(x.macd[k - 1] is not None and x.macd_sig[k - 1] is not None and x.macd_sig[k] is not None
+             and x.macd[k - 1] >= x.macd_sig[k - 1] and x.macd[k] < x.macd_sig[k] for k in (i - 1, i))
+    if up == dn:
+        return R("NEUTRAL", "No MACD cross on the last two candles.")
+    d = 1 if up else -1
+    c, a = x.c[i], x.atr[i]
+    if (c - x.ema50[i]) * d <= 0:
+        return R("NEUTRAL", "The cross runs against the EMA 50 trend, so it is skipped.")
+    return R("BUY" if up else "SELL",
+             "MACD crossed %s its signal line on the trend side of EMA 50." % ("above" if up else "below"),
+             c - d * 1.5 * a, c + d * 3.0 * a)
+
+
+@strat("supertrend", "Supertrend Flip", "Trend",
+       "Supertrend(10, 3) flips direction on one of the latest two candles. Stop at the Supertrend line, target 2R. "
+       "Skipped when that stop is wider than 3 ATR.")
+def s_supertrend(x, i):
+    if i < 60:
+        return NA("Not enough history")
+    up = any(x.st_dir[k - 1] == -1 and x.st_dir[k] == 1 for k in (i - 1, i))
+    dn = any(x.st_dir[k - 1] == 1 and x.st_dir[k] == -1 for k in (i - 1, i))
+    if up == dn:
+        return R("NEUTRAL", "No Supertrend flip on the last two candles.")
+    d = 1 if up else -1
+    c, a, sl = x.c[i], x.atr[i], x.st_line[i]
+    risk = (c - sl) * d
+    if risk <= 0:
+        return R("NEUTRAL", "Price is already beyond the Supertrend line.")
+    if risk > 3 * a:
+        return R("NEUTRAL", "The Supertrend stop is wider than 3 ATR, so it is skipped.")
+    return R("BUY" if up else "SELL", "Supertrend flipped %s." % ("up" if up else "down"), sl, c + d * 2 * risk)
+
+
+# ------------------------------------------------------------- helper series
+def macd_lines(c, fast=12, slow=26, sig=9):
+    ef, es = ema_l(c, fast), ema_l(c, slow)
+    m = [(ef[k] - es[k]) if (ef[k] is not None and es[k] is not None) else None for k in range(len(c))]
+    s = [None] * len(c)
+    first = next((k for k, v in enumerate(m) if v is not None), None)
+    if first is not None:
+        e = ema_l(m[first:], sig)
+        for k, v in enumerate(e):
+            if v is not None:
+                s[first + k] = v
+    return m, s
+
+
+def supertrend(h, l, c, atr, mult=3.0):
+    """Returns (line, direction): direction +1 is up (line below price), -1 is down (line above)."""
+    n = len(c)
+    line, trend = [None] * n, [0] * n
+    fub = flb = None
+    for k in range(n):
+        if atr[k] is None:
+            continue
+        hl2 = (h[k] + l[k]) / 2.0
+        ub, lb = hl2 + mult * atr[k], hl2 - mult * atr[k]
+        if fub is None:
+            fub, flb = ub, lb
+            trend[k] = 1 if c[k] >= hl2 else -1
+        else:
+            pc = c[k - 1]
+            fub = ub if (ub < fub or pc > fub) else fub
+            flb = lb if (lb > flb or pc < flb) else flb
+            if trend[k - 1] == -1 and c[k] > fub:
+                trend[k] = 1
+            elif trend[k - 1] == 1 and c[k] < flb:
+                trend[k] = -1
+            else:
+                trend[k] = trend[k - 1] or (1 if c[k] >= hl2 else -1)
+        line[k] = flb if trend[k] == 1 else fub
+    return line, trend
+
+
+# ================================================================ scoring
+def run_strategy(s, x, i):
+    try:
+        res = s["fn"](x, i)
+    except Exception as e:  # a faulty rule must never take the scan down
+        if DEBUG_RAISE:
+            raise
+        return NA("Could not be evaluated (%s)" % type(e).__name__)
+    return res if res is not None else NA("Not enough data")
+
+
+def evaluate_all(x, i):
+    out = []
+    for s in STRATS:
+        r = dict(run_strategy(s, x, i))
+        r.update({"id": s["id"], "name": s["name"], "group": s["group"]})
+        out.append(r)
+    return out
+
+
+def trend_label(x, i):
+    a, e20, e50, adx = x.atr[i], x.ema20[i], x.ema50[i], x.adx[i]
+    sep = abs(e20 - e50) / a
+    if e20 > e50 and x.c[i] > e50 and e50 > x.ema50[i - 5]:
+        return ("Strong uptrend" if adx >= 25 else "Uptrend"), "up"
+    if e20 < e50 and x.c[i] < e50 and e50 < x.ema50[i - 5]:
+        return ("Strong downtrend" if adx >= 25 else "Downtrend"), "down"
+    if sep < 0.4 and adx < 20:
+        return "Ranging", "flat"
+    return "Mixed / transitioning", "flat"
+
+
+def session_label(x, i):
+    if not x.has_times or not x.intraday:
+        return None
+    u, info = x.u[i], x.day(i)
+    if u.weekday() >= 5:
+        return "Weekend"
+    if info["asia_s"] <= u < info["lon_o"]:
+        return "Asian session"
+    if info["lon_o"] <= u < info["ny_pre"]:
+        return "London session"
+    if info["ny_pre"] <= u < info["lon_c"]:
+        return "London-New York overlap"
+    if info["lon_c"] <= u < info["ny_c"]:
+        return "New York session"
+    return "Late New York / rollover"
+
+
+def market_context(x, i):
+    a = x.atr[i]
+    tl, td = trend_label(x, i)
+    avg = statistics.mean(v for v in x.atr[i - 50:i] if v is not None)
+    ratio = a / avg if avg else 1.0
+    vol = "Low" if ratio < 0.8 else "High" if ratio > 1.25 else "Normal"
+    H, L = x.sw("H", i, 2), x.sw("L", i, 2)
+    if len(H) == 2 and len(L) == 2:
+        st = ("Higher highs, higher lows" if H[0][1] > H[1][1] and L[0][1] > L[1][1]
+              else "Lower highs, lower lows" if H[0][1] < H[1][1] and L[0][1] < L[1][1] else "Mixed swings")
+    else:
+        st = "Not enough swings"
+    r = x.rsi[i]
+    mom = "Overbought" if r >= 70 else "Oversold" if r <= 30 else "Bullish" if r >= 55 else "Bearish" if r <= 45 else "Neutral"
+    sq = False
+    hist = [v for v in x.bbw[max(0, i - 100):i - 5] if v is not None]
+    if len(hist) >= 30 and x.bbw[i] is not None:
+        sq = x.bbw[i] <= sorted(hist)[int(len(hist) * 0.25)]
+    return {"trend": tl, "trend_dir": td, "adx": round(x.adx[i], 1), "volatility": vol, "atr_ratio": round(ratio, 2),
+            "structure": st, "rsi": round(r, 1), "momentum": mom, "squeeze": sq, "session": session_label(x, i)}
+
+
+def clean(obj):
+    """Round floats and drop non-finite numbers so the JSON is always valid."""
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [clean(v) for v in obj]
+    return obj
+
+
+
+
+# ================================================================= the vote
+def aggregate(results):
+    """Count the five votes. A signal needs MIN_AGREE strategies on one side and none on the other."""
+    total = len(results)
+    buys = [r for r in results if r["sig"] == "BUY"]
+    sells = [r for r in results if r["sig"] == "SELL"]
+    out = {"total": total, "buy": len(buys), "sell": len(sells), "required": MIN_AGREE,
+           "direction": None, "verdict": "NO SIGNAL", "agree": 0, "confidence": 0, "reason": ""}
+    if buys and sells:
+        out["reason"] = "Strategies conflict: %d buy and %d sell. No trade." % (len(buys), len(sells))
+        return out
+    votes = buys or sells
+    if not votes:
+        out["reason"] = "No strategy is signalling on the latest candles."
+        return out
+    side = "BUY" if buys else "SELL"
+    n = len(votes)
+    out["agree"] = n
+    out["confidence"] = int(round(100.0 * n / total))
+    if n < MIN_AGREE:
+        out["reason"] = "%d of %d strategies point %s. %d are required." % (n, total, side.lower(), MIN_AGREE)
+        return out
+    out.update(direction=side, verdict=side, reason="%d of %d strategies agree." % (n, total))
+    return out
+
+
+PLAN_PRIORITY = ["ny_asia", "ema_cross", "macd_cross", "rsi_reversal", "supertrend"]
+
+
+def build_plan(x, i, side, results):
+    """Levels come from one strategy, never a blend: the highest-priority strategy that agrees.
+    Entry is the last close. The source is named in the result so the levels can be traced."""
+    entry, a = x.c[i], x.atr[i]
+    d = 1 if side == "BUY" else -1
+    agreeing = [r for r in results if r["sig"] == side]
+    src = min(agreeing, key=lambda r: PLAN_PRIORITY.index(r["id"]) if r["id"] in PLAN_PRIORITY else 99)
+    sl = src.get("sl")
+    if sl is None or (entry - sl) * d <= 0:
+        sl = entry - d * 1.5 * a
+    risk = abs(entry - sl)
+    tp = src.get("tp")
+    if tp is None or (tp - entry) * d <= 0:
+        tp = entry + d * 2 * risk
+    return {"side": side, "entry": entry, "sl": sl, "tp": tp, "risk": risk,
+            "rr": round(abs(tp - entry) / risk, 2) if risk > 0 else None, "source": src["name"]}
+
+
+def analyze(x, i):
+    results = evaluate_all(x, i)
+    summary = aggregate(results)
+    plan = build_plan(x, i, summary["direction"], results) if summary["direction"] else None
+    return {"results": results, "summary": summary, "plan": plan, "context": market_context(x, i)}
+
+
+def make_result(x, i, meta):
+    an = analyze(x, i)
+    times_note = meta.get("times_note") or ""
+    return clean({
+        "ok": True,
+        "version": VERSION,
+        "symbol": meta.get("symbol"),
+        "timeframe": tf_label(x.tf_min) if x.tf_min else None,
+        "last_time": x.t[i].strftime("%d %b %Y %H:%M") if x.t[i] else None,
+        "digits": x.digits,
+        "session_times": bool(x.has_times and x.intraday),
+        "times_note": times_note,
+        "summary": an["summary"],
+        "plan": an["plan"],
+        "context": an["context"],
+        "strategies": [{k: r.get(k) for k in ("id", "name", "group", "sig", "ev", "sl", "tp")} for r in an["results"]],
+    })
+
+
+# ==================================================================== routes
+_CACHE = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def _read_upload(field):
+    f = request.files.get(field)
+    if not f:
+        return None
+    return f.read(MAX_IMAGE_BYTES + 1)
+
+
+def _cache_key(raw):
+    tag = "|".join([VERSION, MODEL, str(CHART_GMT), str(MIN_AGREE)])
+    return hashlib.sha256(raw + tag.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key):
+    with _cache_lock:
+        hit = _CACHE.get(key)
+        if hit is not None:
+            _CACHE.move_to_end(key)
+        return hit
+
+
+def _cache_put(key, value):
+    with _cache_lock:
+        _CACHE[key] = value
+        while len(_CACHE) > CACHE_SIZE:
+            _CACHE.popitem(last=False)
+
+
+@app.route("/api/config")
+def api_config():
+    return no_store(jsonify({"brand": BRAND, "vision": bool(API_KEY), "pin": bool(ACCESS_PIN), "version": VERSION,
+                             "strategies": STRATEGY_COUNT, "min_agree": MIN_AGREE}))
+
+
+@app.route("/api/health")
+def api_health():
+    return "ok"
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    blocked = gate()
+    if blocked:
+        return blocked
+    raw = _read_upload("image")
+    if not raw:
+        return jsonify({"ok": False, "error": "Upload a chart screenshot."}), 400
+    if len(raw) > MAX_IMAGE_BYTES:
+        return jsonify({"ok": False, "error": "The screenshot is larger than 12 MB."}), 413
+
+    key = _cache_key(raw)
+    hit = _cache_get(key)
+    if hit is not None:
+        return no_store(jsonify(dict(hit, cached=True)))
+
+    if not API_KEY:
+        return jsonify({"ok": False, "code": "no_key",
+                        "error": "Chart reading is not configured on this server."}), 503
+    if not rate_ok("scan", SCAN_LIMIT):
+        return jsonify({"ok": False, "error": "The scan limit for this hour has been reached. Try again later."}), 429
+    try:
+        img, mt = prepare_image(raw)
+        js = call_vision(img, mt)
+        bars, m = bars_from_vision(js)
+        if m.get("scale") != "actual":
+            raise VisionError("The price scale could not be read, so no levels can be shown. "
+                              "Upload a screenshot where the price axis is visible.")
+        x = Ctx(bars, CHART_GMT, m["tf_min"], m["digits"], "actual", m["has_times"])
+        res = make_result(x, x.n - 1, m)
+    except VisionError as e:
+        return jsonify({"ok": False, "error": str(e)}), 422
+    _cache_put(key, res)
+    return no_store(jsonify(dict(res, cached=False)))
+
+
+INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
-<title>Chart Scanner</title>
-<meta name="theme-color" content="#070b14">
-<link rel="icon" href="/static/favicon.ico" sizes="any">
-<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
-<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
-<link rel="manifest" href="/static/manifest.webmanifest">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>__BRAND__</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23000'/%3E%3Cpath d='M8 22l5-6 4 3 7-9' fill='none' stroke='%232ee59d' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#070b14;--panel:#0d1424;--panel-2:#09101e;--line:#1a2539;--track:#17223a;
-  --text:#e4ebf7;--muted:#7b889f;--accent:#58c4ff;--buy:#2bd98b;--sell:#ff4d6d;--hold:#ffc857;
+  --bg:#000;--s1:#07070a;--s2:#0c0c10;--line:#16161c;--line2:#23232b;
+  --tx:#ececef;--mut:#82828d;--dim:#4f4f5a;
+  --buy:#2ee59d;--sell:#ff5c6c;--warn:#f2b453;
+  --sans:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
-*{box-sizing:border-box}
+*{box-sizing:border-box;margin:0;padding:0}
 [hidden]{display:none!important}
-body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);
-  font:13px/1.5 Inter,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;overflow-x:hidden}
-body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
-  background:radial-gradient(700px 380px at 50% -8%,rgba(88,196,255,.13),transparent 62%),
-             radial-gradient(560px 340px at 100% 100%,rgba(155,140,255,.10),transparent 62%)}
-#bg{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
-.mono{font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+html{background:#000;color-scheme:dark}
+body{background:#000;color:var(--tx);font:12px/1.5 var(--sans);-webkit-font-smoothing:antialiased;min-height:100vh;
+  padding:calc(12px + env(safe-area-inset-top)) 14px calc(20px + env(safe-area-inset-bottom))}
+.wrap{max-width:440px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
 
-.top{position:relative;z-index:1;display:flex;justify-content:space-between;align-items:center;
-  padding:12px 18px;border-bottom:1px solid var(--line);background:rgba(7,11,20,.72);backdrop-filter:blur(6px)}
-.brand{display:flex;align-items:center;gap:10px;font-size:11px;font-weight:600;letter-spacing:2px;text-transform:uppercase}
-.logo{width:20px;height:20px}
-.meta{font-size:11px;color:var(--muted);letter-spacing:.5px}
+/* header */
+.top{display:flex;justify-content:space-between;align-items:center;padding:4px 2px 12px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:9px}
+.mark{width:22px;height:22px}
+.wm{font:600 11px var(--sans);letter-spacing:.28em;text-transform:uppercase}
+.wm b{color:var(--buy);font-weight:600}
+.status{display:flex;align-items:center;gap:6px;font:600 9px var(--sans);letter-spacing:.16em;color:var(--mut);text-transform:uppercase}
+.status i{width:6px;height:6px;border-radius:50%;background:var(--dim);display:block}
+.status.ok i{background:var(--buy);box-shadow:0 0 8px rgba(46,229,157,.6)}
+.status.err i{background:var(--sell)}
 
-main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:22px 16px 36px}
+/* upload */
+.upload{display:flex;flex-direction:column;align-items:center;gap:12px;padding:6px 0 2px}
+.drop{position:relative;width:100%;height:168px;border-radius:24px;border:1px solid var(--line2);
+  background:radial-gradient(120% 90% at 50% 0%,#101016 0%,#050508 70%);display:grid;place-items:center;cursor:pointer;
+  transition:border-color .2s,box-shadow .25s,transform .12s;overflow:hidden;outline:none;-webkit-tap-highlight-color:transparent}
+.drop:hover,.drop:focus-visible,.drop.over{border-color:rgba(46,229,157,.55);box-shadow:0 0 0 1px rgba(46,229,157,.12),0 0 40px -12px rgba(46,229,157,.45)}
+.drop:active{transform:scale(.99)}
+.plus{width:58px;height:58px;border-radius:50%;border:1px solid var(--line2);display:grid;place-items:center;
+  font:300 34px/1 var(--sans);color:var(--buy);background:#08090c;transition:box-shadow .25s,border-color .25s}
+.drop:hover .plus{border-color:rgba(46,229,157,.6);box-shadow:0 0 22px -4px rgba(46,229,157,.5)}
+.cap{font:600 11px var(--sans);letter-spacing:.2em;text-transform:uppercase;color:var(--tx)}
+.hint{font:500 10px var(--sans);letter-spacing:.06em;color:var(--dim);text-align:center}
+.grid-bg{position:absolute;inset:0;pointer-events:none;opacity:.5;
+  background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);
+  background-size:22px 22px;mask-image:radial-gradient(70% 70% at 50% 50%,#000,transparent)}
+.scan{position:absolute;inset:0;pointer-events:none;display:none}
+.scan::after{content:"";position:absolute;left:0;right:0;height:2px;top:0;
+  background:linear-gradient(90deg,transparent,var(--buy),transparent);box-shadow:0 0 14px var(--buy);animation:sweep 1.4s ease-in-out infinite}
+.busy .scan{display:block}
+.busy .plus{animation:pulse 1.4s ease-in-out infinite}
+@keyframes sweep{0%{top:0;opacity:0}10%{opacity:1}90%{opacity:1}100%{top:100%;opacity:0}}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(46,229,157,.35)}50%{box-shadow:0 0 0 10px rgba(46,229,157,0)}}
+.err{font-size:11px;color:var(--sell);text-align:center;min-height:16px}
+.pin{display:flex;gap:8px;align-items:center;justify-content:center}
+.pin input{background:var(--s1);border:1px solid var(--line2);border-radius:10px;color:var(--tx);padding:8px 10px;width:130px;
+  font:500 13px var(--mono);letter-spacing:.3em;text-align:center;outline:none}
+.pin button{background:var(--tx);color:#000;border:0;border-radius:10px;padding:8px 14px;font:600 10px var(--sans);letter-spacing:.14em;cursor:pointer}
 
-.drop{position:relative;display:block;height:300px;cursor:pointer;outline:none;overflow:hidden;
-  border:1.5px dashed rgba(88,196,255,.42);border-radius:18px;
-  background:linear-gradient(180deg,rgba(13,20,36,.92),rgba(9,16,30,.92));
-  transition:border-color .2s,box-shadow .2s,transform .2s}
-.drop:hover,.drop:focus-visible,.drop.over{border-color:var(--accent);
-  box-shadow:0 0 0 1px rgba(88,196,255,.22),0 0 30px rgba(88,196,255,.16)}
-.drop.over{transform:scale(1.01)}
-.drop input{display:none}
-.drop-empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
-.plus{width:54px;height:54px;fill:none;stroke:var(--accent);stroke-width:2;stroke-linecap:round;
-  transition:transform .3s ease}
-.drop:hover .plus{transform:rotate(90deg)}
-.drop-empty span{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#a9c9e6}
-
-.drop-preview{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#05080f}
-.drop-preview img{max-width:calc(100% - 24px);max-height:calc(100% - 24px);object-fit:contain;border-radius:10px}
-.beam{position:absolute;left:0;right:0;top:0;height:2px;opacity:0;pointer-events:none;
-  background:linear-gradient(90deg,transparent,var(--accent),transparent);box-shadow:0 0 14px var(--accent)}
-.drop.scanning .beam{opacity:1;animation:sweep 1.5s ease-in-out infinite}
-@keyframes sweep{0%{top:0}50%{top:calc(100% - 2px)}100%{top:0}}
-
-.hint{margin:10px 2px 0;font-size:11px;color:var(--muted)}
-.status{min-height:18px;margin:8px 2px 0;font-size:12px;color:var(--muted)}
-.status.error{color:var(--sell)}
-
-.results{margin-top:18px;display:grid;gap:12px;animation:rise .35s ease-out}
-@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px}
-.hero{display:flex;justify-content:space-between;align-items:center;gap:16px}
-.sig{font-size:18px;font-weight:700;letter-spacing:1.5px}
-.sub{margin-top:4px;font-size:12px;color:var(--muted)}
-.results.buy{--tone:var(--buy)}
-.results.sell{--tone:var(--sell)}
-.results.hold{--tone:var(--hold)}
-.results .sig{color:var(--tone)}
-
-.ring{position:relative;width:76px;height:76px;flex:none}
-.ring svg{width:100%;height:100%;transform:rotate(-90deg)}
-.ring circle{fill:none;stroke-width:6}
-.ring .track{stroke:var(--track)}
-.ring .arc{stroke:var(--tone);stroke-linecap:round;transition:stroke-dashoffset .9s ease}
-.ring .val{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600}
-
-.facts{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-.facts.three{grid-template-columns:repeat(3,1fr)}
-.fact{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
-.fact span{display:block;font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)}
-.fact b{display:block;margin-top:2px;font-family:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;font-size:13px;font-weight:600}
-
-.section{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px}
-.section h3{margin:0;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);font-weight:600}
-.section small{font-size:10px;color:var(--muted)}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-.grid .tile:last-child:nth-child(odd){grid-column:1 / -1}
-.tile{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:11px 12px;animation:rise .4s both}
-.tile-top{display:flex;justify-content:space-between;align-items:center}
-.fam{font-size:10px;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted)}
-.chip{font-size:10px;font-weight:700;letter-spacing:1px;padding:2px 8px;border-radius:6px;border:1px solid}
-.chip.buy{color:var(--buy);border-color:rgba(43,217,139,.4);background:rgba(43,217,139,.08)}
-.chip.sell{color:var(--sell);border-color:rgba(255,77,109,.4);background:rgba(255,77,109,.08)}
-.chip.flat{color:var(--muted);border-color:var(--line)}
-.tile-name{margin:7px 0 4px;font-size:13px;font-weight:500}
-.reading{font-size:12px;color:var(--muted);line-height:1.4}
-
-.foot{margin:22px 0 0;text-align:center;font-size:11px;color:var(--muted)}
-
-@media(max-width:600px){
-  .facts{grid-template-columns:repeat(2,1fr)}
-  .facts.three{grid-template-columns:repeat(3,1fr)}
-  .grid{grid-template-columns:1fr}
-  .drop{height:260px}
-}
+/* result */
+.card{background:linear-gradient(180deg,var(--s2),var(--s1));border:1px solid var(--line);border-radius:18px;padding:16px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.lbl{font:600 9px var(--sans);letter-spacing:.2em;color:var(--dim);text-transform:uppercase}
+.verdict{font:600 30px/1 var(--sans);letter-spacing:.06em;margin:12px 0 4px}
+.verdict.BUY{color:var(--buy)}.verdict.SELL{color:var(--sell)}.verdict.none{color:var(--mut)}
+.reason{color:var(--mut);font-size:11.5px;min-height:17px}
+.conf{margin-top:14px;display:flex;align-items:center;gap:12px}
+.seg{display:flex;gap:4px;flex:1}
+.seg span{flex:1;height:6px;border-radius:3px;background:var(--line2)}
+.seg span.on.BUY{background:var(--buy)}.seg span.on.SELL{background:var(--sell)}.seg span.on.none{background:var(--dim)}
+.pct{font:500 12px var(--mono);min-width:44px;text-align:right}
+.plan{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:14px}
+.plan div{background:var(--s1);padding:10px 12px}
+.plan span{display:block;font:600 9px var(--sans);letter-spacing:.18em;color:var(--dim);text-transform:uppercase}
+.plan b{font:500 14px var(--mono);letter-spacing:-.01em}
+.plan .sl b{color:var(--sell)}.plan .tp b{color:var(--buy)}
+.strats{margin-top:14px;border-top:1px solid var(--line)}
+.st{display:grid;grid-template-columns:1fr auto;gap:2px 12px;padding:10px 0;border-bottom:1px solid var(--line);align-items:center}
+.st:last-child{border-bottom:0}
+.st .n{font:600 12px var(--sans)}
+.st .g{font:500 9px var(--sans);letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin-left:8px}
+.st .e{grid-column:1/2;color:var(--mut);font-size:11px;line-height:1.45}
+.vote{grid-row:1/3;grid-column:2;font:600 9px var(--sans);letter-spacing:.14em;padding:4px 9px;border-radius:999px;border:1px solid var(--line2);color:var(--dim);min-width:52px;text-align:center}
+.vote.BUY{color:var(--buy);border-color:rgba(46,229,157,.4);background:rgba(46,229,157,.07)}
+.vote.SELL{color:var(--sell);border-color:rgba(255,92,108,.4);background:rgba(255,92,108,.07)}
+.foot{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font:500 10px var(--mono);color:var(--dim);margin-top:12px}
+.note{font-size:10.5px;color:var(--warn);margin-top:10px}
+.psrc{font:500 10px var(--sans);color:var(--dim);margin-top:8px;letter-spacing:.02em}
+.disc{text-align:center;color:var(--dim);font-size:10px;line-height:1.55;padding:4px 10px 0}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
-<canvas id="bg" aria-hidden="true"></canvas>
-
-<header class="top">
-  <div class="brand">
-    <svg class="logo" viewBox="0 0 20 20" aria-hidden="true">
-      <line x1="4" y1="1" x2="4" y2="19" stroke="#2bd98b" stroke-width="1.4"/>
-      <rect x="2.5" y="5" width="3" height="8" fill="#2bd98b"/>
-      <line x1="10" y1="0" x2="10" y2="18" stroke="#ff4d6d" stroke-width="1.4"/>
-      <rect x="8.5" y="4" width="3" height="9" fill="#ff4d6d"/>
-      <line x1="16" y1="2" x2="16" y2="20" stroke="#58c4ff" stroke-width="1.4"/>
-      <rect x="14.5" y="7" width="3" height="7" fill="#58c4ff"/>
-    </svg>
-    <span>Chart Scanner</span>
-  </div>
-  <div class="meta">5 strategies</div>
-</header>
-
-<main>
-  <label id="drop" class="drop" tabindex="0" role="button" aria-label="Upload chart">
-    <input id="file" type="file" accept="image/png,image/jpeg,image/webp">
-    <div id="drop-empty" class="drop-empty">
-      <svg class="plus" viewBox="0 0 54 54" aria-hidden="true">
-        <path d="M27 8v38M8 27h38"/>
-      </svg>
-      <span>Upload chart</span>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#050507" stroke="#23232b"/><path d="M8 22l5-6 4 3 7-9" fill="none" stroke="#2ee59d" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div class="wm" id="brand">__BRAND__</div>
     </div>
-    <div id="drop-preview" class="drop-preview" hidden>
-      <img id="preview" alt="Uploaded chart">
-      <div class="beam"></div>
+    <div class="status" id="status"><i></i><span id="statusTxt">Connecting</span></div>
+  </header>
+
+  <section class="upload" id="uploadSec">
+    <div class="pin" id="pinRow" hidden>
+      <input id="pinIn" type="password" inputmode="numeric" placeholder="Access PIN" autocomplete="off">
+      <button id="pinBtn" type="button">UNLOCK</button>
     </div>
-  </label>
-  <p class="hint">Use a screenshot of the chart. Green and red candles are read.</p>
-  <p id="status" class="status"></p>
+    <div class="drop" id="drop" role="button" tabindex="0" aria-label="Upload chart">
+      <div class="grid-bg"></div>
+      <div class="plus" aria-hidden="true">+</div>
+      <div class="scan"></div>
+    </div>
+    <div class="cap">Upload chart</div>
+    <div class="hint">PNG or JPG screenshot with the price axis visible</div>
+    <input id="file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+    <div class="err" id="err"></div>
+  </section>
 
-  <section id="results" class="results" hidden></section>
+  <section class="card" id="result" hidden>
+    <div class="row">
+      <span class="lbl">Signal</span>
+      <span class="lbl" id="readTop"></span>
+    </div>
+    <div class="verdict none" id="verdict">NO SIGNAL</div>
+    <div class="reason" id="reason"></div>
+    <div class="conf">
+      <div class="seg" id="seg"></div>
+      <div class="pct" id="pct">0%</div>
+    </div>
+    <div class="plan" id="plan" hidden>
+      <div><span>Entry</span><b id="pEntry">-</b></div>
+      <div class="sl"><span>Stop</span><b id="pSl">-</b></div>
+      <div class="tp"><span>Target</span><b id="pTp">-</b></div>
+      <div><span>Reward / risk</span><b id="pRr">-</b></div>
+    </div>
+    <div class="psrc" id="pSrc" hidden></div>
+    <div class="note" id="note" hidden></div>
+    <div class="strats" id="strats"></div>
+    <div class="foot"><span id="fLast"></span><span id="fCache"></span></div>
+  </section>
 
-  <p class="foot">Educational tool, not financial advice. ATR is the average candle range. Past readings do not guarantee future ones.</p>
-</main>
+  <p class="disc">Rule-based analysis of one screenshot. Not financial advice. Trading carries a high risk of loss.</p>
+</div>
 
 <script>
-const $ = (id) => document.getElementById(id);
-const drop = $("drop");
-const fileInput = $("file");
-const emptyBox = $("drop-empty");
-const previewBox = $("drop-preview");
-const preview = $("preview");
-const statusLine = $("status");
-const results = $("results");
+(function(){
+'use strict';
+var $=function(id){return document.getElementById(id);};
+var cfg=null, pin=sessionStorage.getItem('scan_pin')||'';
+var DASH='\u2014';
 
-const VOTE = {"1": ["BUY", "buy"], "-1": ["SELL", "sell"], "0": ["NEUTRAL", "flat"]};
-const RING = 2 * Math.PI * 34;
-const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"})[c]);
+function setStatus(kind,txt){var s=$('status');s.className='status '+(kind||'');$('statusTxt').textContent=txt;}
+function showErr(msg){$('err').textContent=msg||'';}
+function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined&&text!==null)e.textContent=text;return e;}
+function fmt(v,d){return (typeof v==='number'&&isFinite(v))?v.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}):DASH;}
 
-function setStatus(msg, kind) {
-  statusLine.textContent = msg;
-  statusLine.className = "status" + (kind ? " " + kind : "");
+function loadConfig(){
+  fetch('/api/config',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){
+    cfg=c;
+    $('brand').innerHTML='';
+    var parts=String(c.brand||'AlgoD Scanner').split(' ');
+    var first=parts[0]||'';var rest=parts.slice(1).join(' ');
+    $('brand').appendChild(document.createTextNode(first));
+    if(rest){$('brand').appendChild(document.createTextNode(' '));var b=el('b','',rest);$('brand').appendChild(b);}
+    if(!c.vision){setStatus('err','Offline');showErr('Chart reading is not configured on this server.');}
+    else if(c.pin&&!pin){setStatus('','Locked');$('pinRow').hidden=false;}
+    else setStatus('ok','Ready');
+  }).catch(function(){setStatus('err','Offline');});
 }
 
-fileInput.addEventListener("change", () => {
-  const picked = fileInput.files[0];
-  fileInput.value = "";
-  if (picked) scan(picked);
-});
-
-drop.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" || e.key === " ") {
-    e.preventDefault();
-    fileInput.click();
-  }
-});
-["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => {
-  e.preventDefault();
-  drop.classList.add("over");
-}));
-["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => {
-  e.preventDefault();
-  drop.classList.remove("over");
-}));
-drop.addEventListener("drop", (e) => {
-  const dropped = e.dataTransfer.files[0];
-  if (dropped) scan(dropped);
-});
-
-async function scan(file) {
-  if (!file.type.startsWith("image/")) {
-    setStatus("Use a PNG, JPG or WEBP screenshot.", "error");
-    return;
-  }
-  preview.src = URL.createObjectURL(file);
-  emptyBox.hidden = true;
-  previewBox.hidden = false;
-  drop.classList.add("scanning");
-  results.hidden = true;
-  results.innerHTML = "";
-  setStatus("Reading the chart", "");
-
-  const body = new FormData();
-  body.append("image", file);
-  try {
-    const response = await fetch("/api/scan", {method: "POST", body});
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "Scan failed.");
-    setStatus("", "");
-    render(data);
-  } catch (err) {
-    setStatus(err.message, "error");
-  } finally {
-    drop.classList.remove("scanning");
-  }
+function unlock(){
+  var v=$('pinIn').value.trim();
+  if(!v)return;
+  pin=v;sessionStorage.setItem('scan_pin',v);$('pinIn').value='';
+  $('pinRow').hidden=true;setStatus('ok','Ready');showErr('');
 }
 
-function render(d) {
-  const sig = d.signal.toLowerCase();
-  const pct = d.confidence;
+function busy(on){
+  var d=$('drop');
+  if(on){d.parentNode.classList.add('busy');}else{d.parentNode.classList.remove('busy');}
+}
 
-  const tiles = d.strategies.map((s, i) => {
-    const [label, tone] = VOTE[String(s.vote)];
-    return `<div class="tile" style="animation-delay:${i * 40}ms">
-      <div class="tile-top"><span class="fam">${esc(s.family)}</span><span class="chip ${tone}">${label}</span></div>
-      <div class="tile-name">${esc(s.name)}</div>
-      <div class="reading">${esc(s.reading)}</div>
-    </div>`;
-  }).join("");
+function scan(file){
+  if(!file)return;
+  if(file.size>12*1024*1024){showErr('The screenshot is larger than 12 MB.');return;}
+  showErr('');$('result').hidden=true;busy(true);setStatus('','Scanning');
+  var fd=new FormData();fd.append('image',file,file.name||'chart.png');
+  var h={};if(pin)h['X-Access-Pin']=pin;
+  fetch('/api/scan',{method:'POST',body:fd,headers:h,cache:'no-store'}).then(function(r){
+    return r.json().catch(function(){return {ok:false,error:'The server returned an unexpected reply.'};}).then(function(j){return {status:r.status,body:j};});
+  }).then(function(x){
+    busy(false);
+    if(x.status===401){pin='';sessionStorage.removeItem('scan_pin');$('pinRow').hidden=false;setStatus('','Locked');showErr('Incorrect PIN.');return;}
+    if(!x.body||!x.body.ok){showErr((x.body&&x.body.error)||'The chart could not be scanned.');setStatus(cfg&&cfg.vision?'ok':'err',cfg&&cfg.vision?'Ready':'Offline');return;}
+    setStatus('ok','Ready');render(x.body);
+  }).catch(function(){busy(false);setStatus('err','Offline');showErr('Could not reach the server. Try again.');});
+}
 
-  results.className = `results ${sig}`;
-  results.innerHTML = `
-    <div class="card">
-      <div class="hero">
-        <div>
-          <div class="sig">${esc(d.signal)}</div>
-          <div class="sub">${esc(d.reason)}</div>
-        </div>
-        <div class="ring">
-          <svg viewBox="0 0 76 76">
-            <circle class="track" cx="38" cy="38" r="34"></circle>
-            <circle class="arc" cx="38" cy="38" r="34" stroke-dasharray="${RING}"
-              stroke-dashoffset="${RING}" data-target="${RING * (1 - pct / 100)}"></circle>
-          </svg>
-          <div class="val mono">${pct}%</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="facts">
-      <div class="fact"><span>Buy votes</span><b>${d.buy_votes}</b></div>
-      <div class="fact"><span>Sell votes</span><b>${d.sell_votes}</b></div>
-      <div class="fact"><span>Neutral</span><b>${d.neutral}</b></div>
-      <div class="fact"><span>Newest candle</span><b>${esc(d.newest_candle)}</b></div>
-    </div>
-
-    <div class="facts three">
-      <div class="fact"><span>Stop</span><b>${d.stop_atr} ATR</b></div>
-      <div class="fact"><span>Target</span><b>${d.target_atr} ATR</b></div>
-      <div class="fact"><span>Reward : risk</span><b>1 : ${d.reward_risk}</b></div>
-    </div>
-
-    <div class="card">
-      <div class="section">
-        <h3>Strategies</h3>
-        <small>current state of the chart</small>
-      </div>
-      <div class="grid">${tiles}</div>
-    </div>`;
-  results.hidden = false;
-
-  requestAnimationFrame(() => {
-    const arc = results.querySelector(".arc");
-    if (arc) arc.style.strokeDashoffset = arc.dataset.target;
+function render(r){
+  var s=r.summary||{}, dig=typeof r.digits==='number'?r.digits:2;
+  var dir=s.direction;
+  var v=$('verdict');
+  v.textContent=dir||'NO SIGNAL';
+  v.className='verdict '+(dir?dir:'none');
+  $('reason').textContent=s.reason||'';
+  var top=Math.max(s.buy||0,s.sell||0), total=s.total||5;
+  var seg=$('seg');seg.textContent='';
+  for(var k=0;k<total;k++){var sp=el('span',(k<top?'on '+(dir||'none'):''));seg.appendChild(sp);}
+  $('pct').textContent=(s.confidence||0)+'%';
+  $('readTop').textContent=[r.symbol,r.timeframe].filter(Boolean).join(' \u00b7 ')||'';
+  var p=r.plan;
+  if(p){
+    $('plan').hidden=false;
+    $('pEntry').textContent=fmt(p.entry,dig);
+    $('pSl').textContent=fmt(p.sl,dig);
+    $('pTp').textContent=fmt(p.tp,dig);
+    $('pRr').textContent=(typeof p.rr==='number')?(p.rr.toFixed(2)+'R'):DASH;
+    $('pSrc').hidden=false;$('pSrc').textContent='Levels from '+(p.source||'the agreeing strategies')+'. Entry is the last close.';
+  }else{$('plan').hidden=true;$('pSrc').hidden=true;}
+  var note=$('note');
+  if(!r.session_times){note.hidden=false;note.textContent='Session strategy skipped: candle times could not be read from this chart.';}
+  else note.hidden=true;
+  var list=$('strats');list.textContent='';
+  (r.strategies||[]).forEach(function(st){
+    var row=el('div','st');
+    var nm=el('div','');nm.appendChild(el('span','n',st.name));nm.appendChild(el('span','g',st.group||''));
+    row.appendChild(nm);
+    var vt=(st.sig==='BUY'||st.sig==='SELL')?st.sig:DASH;
+    row.appendChild(el('span','vote '+(vt==='BUY'||vt==='SELL'?vt:''),vt));
+    row.appendChild(el('div','e',st.ev||''));
+    list.appendChild(row);
   });
+  var last=r.last_time?('Last candle '+r.last_time):'';
+  $('fLast').textContent=last;
+  $('fCache').textContent=r.cached?'Stored result':'';
+  $('result').hidden=false;
+  $('result').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
-// Faint candlesticks drifting behind the page
-const bg = $("bg");
-const bctx = bg.getContext("2d");
-const STEP = 18;
-let series = [];
-let shift = 0;
-const yAt = (v, h) => h * 0.5 - (v - 60) * 5;
+/* events */
+var drop=$('drop'), file=$('file');
+drop.addEventListener('click',function(){file.click();});
+drop.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();file.click();}});
+file.addEventListener('change',function(){if(file.files&&file.files[0])scan(file.files[0]);file.value='';});
+['dragenter','dragover'].forEach(function(t){drop.addEventListener(t,function(e){e.preventDefault();drop.classList.add('over');});});
+['dragleave','drop'].forEach(function(t){drop.addEventListener(t,function(e){e.preventDefault();drop.classList.remove('over');});});
+drop.addEventListener('drop',function(e){var f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];if(f)scan(f);});
+$('pinBtn').addEventListener('click',unlock);
+$('pinIn').addEventListener('keydown',function(e){if(e.key==='Enter')unlock();});
 
-function nextCandle(prev) {
-  const o = prev;
-  const c = o + (60 - o) * 0.04 + (Math.random() - 0.5) * 4;
-  return {o, c, h: Math.max(o, c) + Math.random() * 2, l: Math.min(o, c) - Math.random() * 2};
-}
-
-function resizeBg() {
-  bg.width = innerWidth;
-  bg.height = innerHeight;
-  series = [];
-  let p = 60;
-  for (let i = 0; i < Math.ceil(innerWidth / STEP) + 2; i++) {
-    const k = nextCandle(p);
-    series.push(k);
-    p = k.c;
-  }
-}
-
-function paintBg() {
-  const h = bg.height;
-  bctx.clearRect(0, 0, bg.width, h);
-  shift += 0.3;
-  if (shift >= STEP) {
-    shift -= STEP;
-    series.shift();
-    series.push(nextCandle(series[series.length - 1].c));
-  }
-  series.forEach((k, i) => {
-    const x = i * STEP - shift;
-    const rgb = k.c >= k.o ? "43,217,139" : "255,77,109";
-    bctx.strokeStyle = `rgba(${rgb},0.16)`;
-    bctx.fillStyle = `rgba(${rgb},0.12)`;
-    bctx.beginPath();
-    bctx.moveTo(x, yAt(k.h, h));
-    bctx.lineTo(x, yAt(k.l, h));
-    bctx.stroke();
-    const top = yAt(Math.max(k.o, k.c), h);
-    const bottom = yAt(Math.min(k.o, k.c), h);
-    bctx.fillRect(x - 3.5, top, 7, Math.max(2, bottom - top));
-  });
-  requestAnimationFrame(paintBg);
-}
-
-addEventListener("resize", resizeBg);
-resizeBg();
-if (!matchMedia("(prefers-reduced-motion: reduce)").matches) requestAnimationFrame(paintBg);
+loadConfig();
+})();
 </script>
 </body>
 </html>
 """
 
 
+@app.route("/")
+def index():
+    return no_store(Response(INDEX_HTML.replace("__BRAND__", BRAND), mimetype="text/html"))
+
+
+@app.errorhandler(413)
+def too_large(_e):
+    return jsonify({"ok": False, "error": "The upload is too large."}), 413
+
+
 if __name__ == "__main__":
-    # Development server. In production run: gunicorn app:app --bind 0.0.0.0:$PORT
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
