@@ -54,9 +54,24 @@ def _load(raw):
 
 
 def _masks(arr):
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    green = (g > r + 45) & (g > b + 25)
-    red = (r > g + 55) & (r > b + 45)
+    """Bullish and bearish candle pixels, classified by hue so any chart theme works.
+    Bullish: green to teal (hue about 90-200 degrees). Bearish: red to pink (about 335-20 degrees).
+    Blue text (about 210 degrees), white text and grey borders are not candles and are excluded."""
+    f = arr.astype(float) / 255.0
+    mx = f.max(axis=2)
+    mn = f.min(axis=2)
+    chroma = mx - mn
+    sat = chroma / (mx + 1e-9)
+    r, g, b = f[..., 0], f[..., 1], f[..., 2]
+    hue = np.zeros(mx.shape)
+    d = np.where(chroma > 1e-9, chroma, 1.0)
+    hue = np.where(mx == r, ((g - b) / d) % 6, hue)
+    hue = np.where(mx == g, (b - r) / d + 2, hue)
+    hue = np.where(mx == b, (r - g) / d + 4, hue)
+    hue = hue * 60.0
+    vivid = (sat >= 0.3) & (mx >= 0.25) & (chroma > 0.12)
+    green = vivid & (hue >= 90) & (hue <= 200)
+    red = vivid & ((hue <= 20) | (hue >= 335))
     return green, red
 
 
@@ -155,13 +170,15 @@ def _pitch_and_phase(profile):
     peaks is the pitch, refined by a phase search against the profile."""
     xs = np.where(profile > 0)[0]
     if len(xs) < 12:
-        raise ChartError("Too few candles were found in the chart.")
+        raise ChartError("No green or red candles were found. The reader needs green (up) and red (down) "
+                         "candles on a dark background.")
     prof = profile.astype(float)
     peaks = [x for x in range(1, len(prof) - 1)
              if prof[x] > 0 and prof[x] >= prof[x - 1] and prof[x] > prof[x + 1]]
     diffs = [b - a for a, b in zip(peaks, peaks[1:]) if 1 <= b - a <= 20]
     if len(diffs) < 8:
-        raise ChartError("Too few candles were found in the chart.")
+        raise ChartError("No green or red candles were found. The reader needs green (up) and red (down) "
+                         "candles on a dark background.")
     p0 = float(np.median(diffs))
     best = None
     for pitch in np.arange(p0 - 0.5, p0 + 0.51, 0.02):
@@ -252,44 +269,72 @@ def _symbol(arr, plot):
 
 
 def _timeframe_and_times(labels, centres, pitch):
-    """Timeframe and first/last candle times from dated time-axis labels.
-    One misread label cannot set the result: the bar size comes from the median of consecutive labels,
-    and the first candle time is the value most labels agree on.
-    Returns (tf_minutes, first_time, last_time, note); on failure tf is None and the note says why."""
+    """Bar size and a time for every candle centre, from the dated time-axis labels.
+    Each pair of labels votes for a standard timeframe, so one misread label cannot decide it.
+    Times are interpolated between labels, so a gap in the chart's data (MT5 skips missing bars) only
+    affects the candles inside that gap. Returns (tf_minutes, times_or_None, note)."""
+    from collections import Counter
     from datetime import timedelta
     year = datetime.utcnow().year
     dated = sorted([lb for lb in labels if lb.get("dt")], key=lambda lb: lb["x"])
-    if len(dated) < 2:
-        return None, None, None, "No readable date labels on the time axis"
-    times = []
+    pts = []
     for lb in dated:
         d, mo, hh, mi = lb["dt"]
         try:
-            times.append((lb["x"], datetime(year, mo, d, hh, mi)))
+            t = datetime(year, mo, d, hh, mi)
         except ValueError:
             continue
-    rates = []
-    for (xa, ta), (xb, tb) in zip(times, times[1:]):
-        n = (xb - xa) / pitch
-        if n >= 5 and tb > ta:
-            rates.append((tb - ta).total_seconds() / 60.0 / n)
-    if not rates:
-        return None, None, None, "Time labels are too close together or out of order"
-    per = float(np.median(rates))
-    tf_min, _ = min(TF_CHOICES, key=lambda c: abs(c[0] - per))
-    if abs(tf_min - per) > 0.15 * tf_min:
-        return None, None, None, "The bar size could not be matched to a standard timeframe"
-    implied = [t - timedelta(minutes=(x - centres[0]) / pitch * tf_min) for x, t in times]
-    implied.sort()
-    best = None
-    for v in implied:
-        group = [w for w in implied if abs((w - v).total_seconds()) <= tf_min * 60 / 2.0]
-        if best is None or len(group) > len(best):
-            best = group
-    anchor = best[len(best) // 2]
-    last_t = anchor + timedelta(minutes=(centres[-1] - centres[0]) / pitch * tf_min)
-    return tf_min, anchor.replace(second=0, microsecond=0), last_t.replace(second=0, microsecond=0), \
-        "Times read from the time axis"
+        if not pts or (t > pts[-1][1] and lb["x"] > pts[-1][0]):
+            pts.append((lb["x"], t))
+    if len(pts) < 2:
+        return None, None, "No readable date labels on the time axis"
+    votes = []
+    for (xa, ta), (xb, tb) in zip(pts, pts[1:]):
+        bars = (xb - xa) / pitch
+        if bars < 3:
+            continue
+        per = (tb - ta).total_seconds() / 60.0 / bars
+        votes.append(min(TF_CHOICES, key=lambda c: abs(c[0] - per))[0])
+    if not votes:
+        return None, None, "Time labels are too close together to set the bar size"
+    tf_min, count = Counter(votes).most_common(1)[0]
+    if count * 2 < len(votes):
+        return None, None, "The time labels do not agree on one bar size"
+
+    def time_at(x):
+        if x <= pts[0][0]:
+            return pts[0][1] + timedelta(minutes=(x - pts[0][0]) / pitch * tf_min)
+        if x >= pts[-1][0]:
+            return pts[-1][1] + timedelta(minutes=(x - pts[-1][0]) / pitch * tf_min)
+        for (xa, ta), (xb, tb) in zip(pts, pts[1:]):
+            if xa <= x <= xb:
+                return ta + (tb - ta) * ((x - xa) / (xb - xa))
+        return pts[-1][1]
+
+    # A label whose every neighbouring gap is impossible for this bar size was misread (for example the day).
+    # Gaps in the data only make a gap wider, so a slightly wide gap is kept.
+    def bad_gap(xa, ta, xb, tb):
+        bars = (xb - xa) / pitch
+        if bars < 1:
+            return False
+        per = (tb - ta).total_seconds() / 60.0 / bars
+        return per > 2.0 * tf_min or per < 0.5 * tf_min
+
+    keep = []
+    for i, (x, t) in enumerate(pts):
+        touching = []
+        if i > 0:
+            touching.append(bad_gap(pts[i - 1][0], pts[i - 1][1], x, t))
+        if i + 1 < len(pts):
+            touching.append(bad_gap(x, t, pts[i + 1][0], pts[i + 1][1]))
+        if touching and all(touching):
+            continue
+        keep.append((x, t))
+    if len(keep) >= 2:
+        pts = keep
+
+    times = [time_at(x).replace(second=0, microsecond=0) for x in centres]
+    return tf_min, times, "Times read from the time axis"
 
 
 def read_chart(raw):
@@ -332,7 +377,8 @@ def read_chart(raw):
         c += pitch
     centres = [cc for cc in centres if cc >= xfirst - pitch / 2]
     if len(centres) < 40:
-        raise ChartError("Only %d candles could be read; at least 40 are needed." % len(centres))
+        raise ChartError("Only %d candles are visible; at least 40 are needed. Zoom out so more candles show, "
+                         "then screenshot again." % len(centres))
 
     def price(yy):
         return a + b * (yy + y0)
@@ -368,11 +414,13 @@ def read_chart(raw):
         kept.append(cc)
 
     if len(candles) < 40:
-        raise ChartError("Only %d candles could be read; at least 40 are needed." % len(candles))
+        raise ChartError("Only %d candles are visible; at least 40 are needed. Zoom out so more candles show, "
+                         "then screenshot again." % len(candles))
 
     labels = _time_labels(arr, plot)
-    tf_min, t_first, t_last, tnote = _timeframe_and_times(labels, kept, pitch)
+    tf_min, times, tnote = _timeframe_and_times(labels, kept, pitch)
     symbol = _symbol(arr, plot)
+    fmt = "%Y-%m-%d %H:%M"
     out = {
         "readable": True,
         "quality": "medium",
@@ -380,8 +428,9 @@ def read_chart(raw):
         "timeframe": None,
         "scale": "actual",
         "calibration": None,
-        "first_candle_time": t_first.strftime("%Y-%m-%d %H:%M") if t_first else None,
-        "last_candle_time": t_last.strftime("%Y-%m-%d %H:%M") if t_last else None,
+        "first_candle_time": times[0].strftime(fmt) if times else None,
+        "last_candle_time": times[-1].strftime(fmt) if times else None,
+        "candle_times": [t.strftime(fmt) for t in times] if times else None,
         "candles": candles,
         "notes": tnote,
     }
