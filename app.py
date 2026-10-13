@@ -180,8 +180,10 @@ def bars_from_vision(js, tf_override=None):
     if not js.get("readable"):
         raise VisionError("Could not read this chart: %s" % (js.get("notes") or "no candles found") )
     raw = js.get("candles") or []
-    out = []
-    for c in raw:
+    ct = js.get("candle_times") or []
+    per_candle = len(ct) == len(raw)
+    out, row_times = [], []
+    for k, c in enumerate(raw):
         try:
             o, h, l, cl = (float(v) for v in c[:4])
         except (TypeError, ValueError, IndexError):
@@ -189,9 +191,12 @@ def bars_from_vision(js, tf_override=None):
         if not all(math.isfinite(v) for v in (o, h, l, cl)):
             continue
         out.append([o, max(h, o, cl), min(l, o, cl), cl])
+        if per_candle:
+            row_times.append(ct[k])
     if len(out) < MIN_SCAN_BARS:
         raise VisionError("Only %d candles could be read; at least %d are needed. Zoom out so more candles are visible, then upload again." % (len(out), MIN_SCAN_BARS))
     out = out[-300:]
+    row_times = row_times[-300:]
     scale = js.get("scale") if js.get("scale") in ("actual", "normalized") else "normalized"
     cal = js.get("calibration")
     digits = 1
@@ -227,6 +232,11 @@ def bars_from_vision(js, tf_override=None):
         elif not t0:
             times = [t1 - timedelta(minutes=tf_min * (n - 1 - k)) for k in range(n)]
             times_note = "Times reconstructed from the last candle (not cross-checked)"
+    if row_times and len(row_times) == len(out):
+        parsed = [parse_dt(x) for x in row_times]
+        if all(p is not None for p in parsed):
+            times = parsed
+            times_note = "Times read from the time axis"
     bars = [{"t": times[k], "o": r[0], "h": r[1], "l": r[2], "c": r[3]} for k, r in enumerate(out)]
     meta = {"digits": digits, "scale": scale, "tf_min": tf_min, "has_times": times[-1] is not None,
             "symbol": js.get("symbol"), "quality": js.get("quality") or "medium", "notes": js.get("notes") or "",
